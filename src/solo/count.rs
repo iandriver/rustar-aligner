@@ -10,8 +10,8 @@
 //!      CellRanger-compatible MatrixMarket layout (features × barcodes, 1-based).
 
 use crate::error::Error;
-use crate::solo::SoloContext;
 use crate::solo::whitelist::CbWhitelist;
+use crate::solo::{SoloContext, SoloCountRecord};
 use std::collections::HashMap;
 use std::io::Write as _;
 use std::path::Path;
@@ -258,9 +258,18 @@ impl CountMatrix {
 
 /// Build the count matrix from a solo context's collected records.
 ///
+/// Mirrors STAR's `SoloFeature_collapseUMIall.cpp`: rather than building a
+/// global `cell → umi → gene` nested map (one tiny `HashMap` per UMI — tens of
+/// GB of allocator overhead on a real 10x run), the flat record list is sorted
+/// by cell barcode so each cell's reads are contiguous, then **one cell is
+/// processed at a time**. Peak memory is a single cell's `umi → gene` map plus
+/// the flat record Vec, not every cell's nested maps at once.
+///
 /// Per cell, reads are grouped as `umi → gene → read_count`. Multi-gene UMIs
 /// are then resolved per `--soloUMIfiltering`, and finally the surviving UMIs
-/// of each gene are collapsed per `--soloUMIdedup`.
+/// of each gene are collapsed per `--soloUMIdedup`. The output is identical to
+/// the old global-map approach — every step is keyed under a single cell, so
+/// slicing by cell barcode changes only the memory profile.
 fn build_matrix(
     ctx: &SoloContext,
     method: UmiDedup,
@@ -268,35 +277,50 @@ fn build_matrix(
     umi_len: usize,
     pseudocount: f64,
 ) -> CountMatrix {
-    // cell → umi → gene → read multiplicity
-    let mut cells: HashMap<u32, HashMap<u64, HashMap<u32, u32>>> = HashMap::new();
+    // Move the records out of the recorder (no copy — they are not read again
+    // after this point; the run already logged `n_records`).
+    let mut records = std::mem::take(&mut *ctx.recorder.records.lock().unwrap());
 
-    let mut push = |cb: u32, gene: u32, umi: u64| {
-        *cells
-            .entry(cb)
-            .or_default()
-            .entry(umi)
-            .or_default()
-            .entry(gene)
-            .or_insert(0) += 1;
-    };
-
-    for r in ctx.recorder.records.lock().unwrap().iter() {
-        push(r.cb, r.gene, r.umi);
-    }
-    // Resolve deferred 1MM_multi cell barcodes against the exact-count prior.
+    // Resolve deferred 1MM_multi cell barcodes against the exact-count prior
+    // and fold the survivors into the flat record list.
     let exact_counts = ctx.whitelist.exact_count_snapshot();
-    for m in ctx.recorder.multi_records.lock().unwrap().iter() {
+    let multi = std::mem::take(&mut *ctx.recorder.multi_records.lock().unwrap());
+    for m in &multi {
         if let Some(cb) = resolve_multi_cb(&m.candidates, &exact_counts, pseudocount) {
-            push(cb, m.gene, m.umi);
+            records.push(SoloCountRecord {
+                cb,
+                umi: m.umi,
+                gene: m.gene,
+            });
         }
     }
+    drop(multi);
+
+    // Group each cell's reads together so we can process and free one cell at
+    // a time. Unstable sort is in-place (no large temp allocation).
+    records.sort_unstable_by_key(|r| r.cb);
 
     let mut cell_genes: HashMap<u32, HashMap<u32, u64>> = HashMap::new();
-    for (cb, umi_genes) in &cells {
+    let mut i = 0;
+    while i < records.len() {
+        let cb = records[i].cb;
+
+        // umi → gene → read multiplicity, for this cell only.
+        let mut umi_genes: HashMap<u64, HashMap<u32, u32>> = HashMap::new();
+        let mut j = i;
+        while j < records.len() && records[j].cb == cb {
+            let r = &records[j];
+            *umi_genes
+                .entry(r.umi)
+                .or_default()
+                .entry(r.gene)
+                .or_insert(0) += 1;
+            j += 1;
+        }
+
         // (gene → (umi → read_count)) after multi-gene UMI filtering.
         let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::new();
-        for (&umi, genes) in umi_genes {
+        for (&umi, genes) in &umi_genes {
             for (&gene, &rc) in filter_multi_gene_umi(genes, filtering) {
                 *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
             }
@@ -304,9 +328,11 @@ fn build_matrix(
         for (gene, umis) in &gene_umis {
             let count = dedup_count(umis, method, umi_len);
             if count > 0 {
-                cell_genes.entry(*cb).or_default().insert(*gene, count);
+                cell_genes.entry(cb).or_default().insert(*gene, count);
             }
         }
+
+        i = j;
     }
 
     CountMatrix { cell_genes }
@@ -414,22 +440,34 @@ pub fn write_gene_matrix(
 /// `features.tsv`: `gene_id <TAB> gene_name <TAB> "Gene Expression"` (CellRanger
 /// v3 layout). We have no gene names, so the id is repeated.
 fn write_features(path: &Path, gene_ids: &[String]) -> Result<(), Error> {
-    let mut f = std::fs::File::create(path).map_err(|e| Error::io(e, path))?;
+    let mut f =
+        std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| Error::io(e, path))?);
     for id in gene_ids {
         writeln!(f, "{id}\t{id}\tGene Expression").map_err(|e| Error::io(e, path))?;
     }
-    Ok(())
+    f.flush().map_err(|e| Error::io(e, path))
 }
 
 /// `barcodes.tsv`: one barcode per line in sorted whitelist order (the same
 /// order the matrix columns are indexed by).
+///
+/// This lists the full whitelist (millions of lines), so it MUST be buffered —
+/// an unbuffered writer issues one syscall per line and dominates runtime,
+/// especially over a virtiofs mount. Barcodes are unpacked into a reused scratch
+/// buffer to avoid a `String` allocation per line.
 fn write_barcodes(path: &Path, whitelist: &CbWhitelist, n: usize) -> Result<(), Error> {
-    let mut f = std::fs::File::create(path).map_err(|e| Error::io(e, path))?;
+    use std::io::Write as _;
+    let mut f =
+        std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| Error::io(e, path))?);
+    let len = whitelist.barcode_len();
+    let mut line: Vec<u8> = Vec::with_capacity(len + 1);
     for i in 0..n {
-        let bc = whitelist.barcode_string(i as u32).unwrap_or_default();
-        writeln!(f, "{bc}").map_err(|e| Error::io(e, path))?;
+        line.clear();
+        whitelist.unpack_barcode_into(i as u32, &mut line);
+        line.push(b'\n');
+        f.write_all(&line).map_err(|e| Error::io(e, path))?;
     }
-    Ok(())
+    f.flush().map_err(|e| Error::io(e, path))
 }
 
 /// `matrix.mtx`: MatrixMarket coordinate format. Header `nFeatures nBarcodes
@@ -441,7 +479,8 @@ fn write_matrix_mtx(
     n_features: usize,
     n_barcodes: usize,
 ) -> Result<(), Error> {
-    let mut f = std::fs::File::create(path).map_err(|e| Error::io(e, path))?;
+    let mut f =
+        std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| Error::io(e, path))?);
     writeln!(f, "%%MatrixMarket matrix coordinate integer general")
         .map_err(|e| Error::io(e, path))?;
     writeln!(f, "%").map_err(|e| Error::io(e, path))?;
@@ -460,7 +499,7 @@ fn write_matrix_mtx(
             writeln!(f, "{} {} {}", g + 1, cell + 1, genes[&g]).map_err(|e| Error::io(e, path))?;
         }
     }
-    Ok(())
+    f.flush().map_err(|e| Error::io(e, path))
 }
 
 #[cfg(test)]

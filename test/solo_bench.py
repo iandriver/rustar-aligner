@@ -44,12 +44,12 @@ SOLO_COMMON = [
 TIME = ["/usr/bin/time", "-v"]
 
 
-def timed(cmd, logpath, env=None):
+def timed(cmd, logpath, env=None, cwd=None):
     """Run cmd under /usr/bin/time -v; return (seconds, peak_rss_gb, ok)."""
     print("  $", " ".join(str(c) for c in cmd), flush=True)
     t0 = time.time()
     with open(logpath, "w") as lf:
-        r = subprocess.run(TIME + list(map(str, cmd)), stdout=lf, stderr=subprocess.STDOUT, env=env)
+        r = subprocess.run(TIME + list(map(str, cmd)), stdout=lf, stderr=subprocess.STDOUT, env=env, cwd=cwd)
     wall = time.time() - t0
     peak = None
     with open(logpath) as lf:
@@ -60,6 +60,13 @@ def timed(cmd, logpath, env=None):
     if r.returncode != 0:
         print(f"    !! exit {r.returncode}; tail:\n" + "\n".join(txt.splitlines()[-15:]))
     return wall, peak, r.returncode == 0
+
+
+def index_built(idx_dir):
+    """True if a genome index already exists in idx_dir (skip rebuild/reuse)."""
+    return os.path.exists(os.path.join(idx_dir, "Genome")) or os.path.exists(
+        os.path.join(idx_dir, "SA")
+    )
 
 
 def opener(path):
@@ -124,6 +131,9 @@ def main():
     ap.add_argument("--mem-gb", type=int, default=36)
     ap.add_argument("--out", required=True)
     ap.add_argument("--sa-nbases", default="14")
+    ap.add_argument("--chemistry", default="auto", help="CellRanger --chemistry")
+    ap.add_argument("--rust-temp-dir", default=None,
+                    help="rustar --tempDir (caps-sa scratch; point at a disk with space)")
     ap.add_argument("--skip", default="", help="comma list: cellranger,star,rustar")
     args = ap.parse_args()
 
@@ -138,18 +148,23 @@ def main():
         print("\n===== STARsolo =====")
         star_idx = os.path.join(args.out, "star_idx")
         os.makedirs(star_idx, exist_ok=True)
-        s_gen, s_gen_rss, ok = timed(
-            [args.star, "--runMode", "genomeGenerate", "--genomeDir", star_idx,
-             "--genomeFastaFiles", args.fasta, "--sjdbGTFfile", args.gtf,
-             "--sjdbOverhang", "89", "--genomeSAindexNbases", args.sa_nbases,
-             "--runThreadN", args.threads],
-            os.path.join(logs, "star_genomeGenerate.log"))
+        if index_built(star_idx):
+            print("  (STAR index already present — skipping genomeGenerate)")
+            s_gen, s_gen_rss, ok = 0.0, 0.0, True
+        else:
+            s_gen, s_gen_rss, ok = timed(
+                [args.star, "--runMode", "genomeGenerate", "--genomeDir", star_idx,
+                 "--genomeFastaFiles", args.fasta, "--sjdbGTFfile", args.gtf,
+                 "--sjdbOverhang", "89", "--genomeSAindexNbases", args.sa_nbases,
+                 "--runThreadN", args.threads],
+                os.path.join(logs, "star_genomeGenerate.log"))
         star_out = os.path.join(args.out, "star_out") + "/"
         os.makedirs(star_out, exist_ok=True)
+        gz = ["--readFilesCommand", "zcat"] if args.r1.endswith(".gz") else []
         s_run, s_run_rss, ok2 = timed(
             [args.star, "--genomeDir", star_idx, "--readFilesIn", args.r2, args.r1,
-             "--runThreadN", args.threads, "--outSAMtype", "None",
-             "--soloCBwhitelist", args.whitelist, "--outFileNamePrefix", star_out]
+             "--runThreadN", args.threads, "--outSAMtype", "None"] + gz
+            + ["--soloCBwhitelist", args.whitelist, "--outFileNamePrefix", star_out]
             + SOLO_COMMON,
             os.path.join(logs, "star_solo.log"))
         raw = os.path.join(star_out, "Solo.out", "Gene", "raw")
@@ -164,12 +179,17 @@ def main():
         print("\n===== rustar-aligner =====")
         rust_idx = os.path.join(args.out, "rust_idx")
         os.makedirs(rust_idx, exist_ok=True)
-        r_gen, r_gen_rss, ok = timed(
-            [args.rustar, "--runMode", "genomeGenerate", "--genomeDir", rust_idx,
-             "--genomeFastaFiles", args.fasta, "--sjdbGTFfile", args.gtf,
-             "--sjdbOverhang", "89", "--genomeSAindexNbases", args.sa_nbases,
-             "--runThreadN", args.threads],
-            os.path.join(logs, "rustar_genomeGenerate.log"))
+        if index_built(rust_idx):
+            print("  (rustar index already present — skipping genomeGenerate)")
+            r_gen, r_gen_rss, ok = 0.0, 0.0, True
+        else:
+            tmp = ["--tempDir", args.rust_temp_dir] if args.rust_temp_dir else []
+            r_gen, r_gen_rss, ok = timed(
+                [args.rustar, "--runMode", "genomeGenerate", "--genomeDir", rust_idx,
+                 "--genomeFastaFiles", args.fasta, "--sjdbGTFfile", args.gtf,
+                 "--sjdbOverhang", "89", "--genomeSAindexNbases", args.sa_nbases,
+                 "--runThreadN", args.threads] + tmp,
+                os.path.join(logs, "rustar_genomeGenerate.log"))
         rust_out = os.path.join(args.out, "rust_out") + "/"
         os.makedirs(rust_out, exist_ok=True)
         r_run, r_run_rss, ok2 = timed(
@@ -197,10 +217,11 @@ def main():
             [args.cellranger, "count", "--id", "cr_run",
              "--transcriptome", args.transcriptome,
              "--fastqs", args.fastqdir, "--sample", args.sample,
+             "--chemistry", args.chemistry,
              "--create-bam", "false", "--nosecondary",
              "--localcores", str(args.threads), "--localmem", str(args.mem_gb)],
             os.path.join(logs, "cellranger_count.log"),
-            env={**os.environ})
+            env={**os.environ}, cwd=args.out)
         outs = os.path.join(args.out, "cr_run", "outs")
         raw = os.path.join(outs, "raw_feature_bc_matrix")
         results["CellRanger"] = {

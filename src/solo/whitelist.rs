@@ -264,6 +264,21 @@ impl CbWhitelist {
         }
     }
 
+    /// Append the ASCII `ACGT` barcode at sorted index `idx` to `out` without
+    /// allocating a `String` — used when writing the full whitelist to
+    /// `barcodes.tsv` (millions of lines). Appends nothing for an out-of-range
+    /// index or `NoWhitelist`.
+    pub fn unpack_barcode_into(&self, idx: u32, out: &mut Vec<u8>) {
+        if let Self::List { sorted, len, .. } = self
+            && let Some(&packed) = sorted.get(idx as usize)
+        {
+            for i in 0..*len {
+                let shift = 2 * (*len - 1 - i);
+                out.push(decode_base(((packed >> shift) & 0b11) as u8));
+            }
+        }
+    }
+
     /// Load a whitelist from a file (plain or gzip). One barcode per line;
     /// blank lines ignored. Barcodes are encoded, packed, sorted, de-duplicated.
     pub fn load(path: &Path) -> Result<Self, Error> {
