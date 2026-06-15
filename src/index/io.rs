@@ -1,5 +1,4 @@
 use std::fs::File;
-use std::io::Read;
 use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt};
@@ -222,9 +221,20 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
 }
 
 /// Load suffix array from disk.
+///
+/// The `SA` file is **memory-mapped** rather than read into a `Vec`: it is the
+/// largest index component (≈21 GB for mouse) and is accessed by random binary
+/// search during alignment. mmap keeps it as reclaimable file-backed memory
+/// (demand-loaded, dropped — not swapped — under pressure) instead of an
+/// un-reclaimable anonymous allocation. `MADV_RANDOM` disables readahead, which
+/// would waste I/O on the random access pattern.
 fn load_suffix_array(genome_dir: &Path, genome: &Genome) -> Result<SuffixArray, Error> {
     let sa_path = genome_dir.join("SA");
-    let sa_data = std::fs::read(&sa_path).map_err(|e| Error::io(e, &sa_path))?;
+    let file = File::open(&sa_path).map_err(|e| Error::io(e, &sa_path))?;
+    // SAFETY: the SA file is opened read-only and not mutated elsewhere while
+    // the index is loaded; the mapping is only ever read.
+    let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| Error::io(e, &sa_path))? };
+    let _ = mmap.advise(memmap2::Advice::Random); // best-effort; ignore if unsupported
 
     let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
     let word_length = gstrand_bit + 1;
@@ -236,7 +246,7 @@ fn load_suffix_array(genome_dir: &Path, genome: &Genome) -> Result<SuffixArray, 
     // total_bits = (lengthByte - 8) * 8
     // length = (total_bits / wordLength) + 1
     // BUT we need ceiling division to account for partial entries
-    let length_byte = sa_data.len();
+    let length_byte = mmap.len();
     let length = if length_byte < 8 {
         0
     } else {
@@ -245,7 +255,7 @@ fn load_suffix_array(genome_dir: &Path, genome: &Genome) -> Result<SuffixArray, 
         entries + 1
     };
 
-    let data = PackedArray::from_bytes(word_length, length, sa_data);
+    let data = PackedArray::from_mmap(word_length, length, mmap);
 
     Ok(SuffixArray {
         data,
@@ -255,6 +265,11 @@ fn load_suffix_array(genome_dir: &Path, genome: &Genome) -> Result<SuffixArray, 
 }
 
 /// Load SA index from disk.
+///
+/// The small fixed header (`nbases` + the `genomeSAindexStart` array) is read
+/// normally; the packed-data region (≈1.8 GB for mouse) is **memory-mapped**
+/// from its byte offset for the same reason as the SA — reclaimable, demand-
+/// loaded file-backed memory instead of an anonymous `Vec`.
 fn load_sa_index(genome_dir: &Path, gstrand_bit: u32) -> Result<SaIndex, Error> {
     let sai_path = genome_dir.join("SAindex");
     let mut file = File::open(&sai_path).map_err(|e| Error::io(e, &sai_path))?;
@@ -273,15 +288,23 @@ fn load_sa_index(genome_dir: &Path, gstrand_bit: u32) -> Result<SaIndex, Error> 
         genome_sa_index_start.push(val);
     }
 
-    // Read packed data
-    let mut packed_data = Vec::new();
-    file.read_to_end(&mut packed_data)
-        .map_err(|e| Error::io(e, &sai_path))?;
+    // Map the packed-data region: header is `nbases` (8B) + (nbases+1)×8B.
+    let header_len = 8 + 8 * (u64::from(nbases) + 1);
+    // SAFETY: SAindex is opened read-only and never mutated while loaded.
+    // memmap2 handles non-page-aligned offsets internally; the map runs from
+    // `header_len` to EOF and is only ever read.
+    let mmap = unsafe {
+        memmap2::MmapOptions::new()
+            .offset(header_len)
+            .map(&file)
+            .map_err(|e| Error::io(e, &sai_path))?
+    };
+    let _ = mmap.advise(memmap2::Advice::Random);
 
     let word_length = gstrand_bit + 3;
     let num_indices = SaIndex::calculate_num_indices(nbases);
 
-    let data = PackedArray::from_bytes(word_length, num_indices as usize, packed_data);
+    let data = PackedArray::from_mmap(word_length, num_indices as usize, mmap);
 
     Ok(SaIndex {
         nbases,
