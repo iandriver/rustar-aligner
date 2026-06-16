@@ -229,13 +229,22 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
 /// (demand-loaded, dropped — not swapped — under pressure) instead of an
 /// un-reclaimable anonymous allocation. `MADV_RANDOM` disables readahead, which
 /// would waste I/O on the random access pattern.
+/// Best-effort `MADV_RANDOM` on a read-only mmap. `madvise` (and `memmap2::Advice`)
+/// is Unix-only, so this is a no-op on platforms without it (e.g. Windows).
+#[cfg(unix)]
+fn advise_random(mmap: &memmap2::Mmap) {
+    let _ = mmap.advise(memmap2::Advice::Random); // best-effort; ignore if unsupported
+}
+#[cfg(not(unix))]
+fn advise_random(_mmap: &memmap2::Mmap) {}
+
 fn load_suffix_array(genome_dir: &Path, genome: &Genome) -> Result<SuffixArray, Error> {
     let sa_path = genome_dir.join("SA");
     let file = File::open(&sa_path).map_err(|e| Error::io(e, &sa_path))?;
     // SAFETY: the SA file is opened read-only and not mutated elsewhere while
     // the index is loaded; the mapping is only ever read.
     let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| Error::io(e, &sa_path))? };
-    let _ = mmap.advise(memmap2::Advice::Random); // best-effort; ignore if unsupported
+    advise_random(&mmap);
 
     let gstrand_bit = SuffixArray::calculate_gstrand_bit(genome.n_genome);
     let word_length = gstrand_bit + 1;
@@ -300,7 +309,7 @@ fn load_sa_index(genome_dir: &Path, gstrand_bit: u32) -> Result<SaIndex, Error> 
             .map(&file)
             .map_err(|e| Error::io(e, &sai_path))?
     };
-    let _ = mmap.advise(memmap2::Advice::Random);
+    advise_random(&mmap);
 
     let word_length = gstrand_bit + 3;
     let num_indices = SaIndex::calculate_num_indices(nbases);
