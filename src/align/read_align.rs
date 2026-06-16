@@ -1505,7 +1505,7 @@ mod tests {
         }
 
         let genome = Genome {
-            sequence,
+            sequence: sequence.into(),
             n_genome,
             n_genome_real: n_genome,
             n_chr_real: 1,

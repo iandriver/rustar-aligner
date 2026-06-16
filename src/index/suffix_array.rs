@@ -80,7 +80,7 @@ fn compare_suffixes(
     use std::cmp::Ordering;
 
     let n_genome = genome.n_genome as usize;
-    let sequence = &genome.sequence;
+    let sequence = genome.sequence.as_slice();
 
     // Adjust positions for reverse complement
     let start_a = if reverse_a { pos_a + n_genome } else { pos_a };
@@ -184,12 +184,12 @@ mod tests {
 
         let mut suffixes: Vec<(u64, bool)> = Vec::new();
         for i in 0..n_genome {
-            if genome.sequence[i] < 4 {
+            if genome.sequence.base(i) < 4 {
                 suffixes.push((i as u64, false));
             }
         }
         for i in n_genome..(2 * n_genome) {
-            if genome.sequence[i] < 4 {
+            if genome.sequence.base(i) < 4 {
                 suffixes.push(((i - n_genome) as u64, true));
             }
         }
@@ -272,7 +272,7 @@ mod tests {
         // The lexicographically first suffix should start with the smallest base
         let first_entry = sa.get(0);
         let (first_pos, _) = sa.decode(first_entry);
-        let first_base = genome.sequence[first_pos as usize];
+        let first_base = genome.sequence.base(first_pos as usize);
 
         // In "AAB", the first suffix lexicographically is "A" (from pos 0 or 1)
         assert!(first_base == 0); // A

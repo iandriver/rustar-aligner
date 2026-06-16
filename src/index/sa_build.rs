@@ -212,7 +212,7 @@ pub(crate) fn build_impl(genome: &Genome, force_sentinel: bool) -> Result<Suffix
     //     we count here.
     let n_genome = genome.n_genome as usize;
     let n2 = 2 * n_genome;
-    let n_sa_kept: usize = genome.sequence[..n2.min(genome.sequence.len())]
+    let n_sa_kept: usize = genome.sequence.as_slice()[..n2.min(genome.sequence.len())]
         .par_iter()
         .filter(|&&b| b < 4)
         .count();
@@ -300,7 +300,7 @@ where
     // (1) Count spacer runs so we can pick the narrowest alphabet
     //     width that fits. The build itself is a separate pass through
     //     the genome that emits the typed `Vec<S>` for the chosen S.
-    let n_seg = count_spacer_runs(&genome.sequence[..n2]);
+    let n_seg = count_spacer_runs(&genome.sequence.as_slice()[..n2]);
     let alphabet_max = SENTINEL_BASE as u32 + n_seg;
     log::info!("sa_build: counted {n_seg} per-segment sentinels (alphabet max = {alphabet_max})");
 
@@ -317,7 +317,10 @@ where
         sparse_d, 1,
         "non-default sparse_d isn't wired through this path"
     );
-    let n_sa_kept: usize = genome.sequence[..n2].par_iter().filter(|&&b| b < 4).count();
+    let n_sa_kept: usize = genome.sequence.as_slice()[..n2]
+        .par_iter()
+        .filter(|&&b| b < 4)
+        .count();
     log::info!("sa_build: {n_sa_kept} entries after ACGT + sparse-d={sparse_d} filter");
 
     let n_genome_u64 = n_genome as u64;
@@ -364,15 +367,27 @@ where
             "sa_build: RUSTAR_USE_SENTINEL_TRANSFORM=1, alphabet fits u8 — \
              using sentinel-transform arm"
         );
-        let t_prime: Vec<u8> = build_sentinel_transformed_text(&genome.sequence[..n2], n_seg);
-        dispatch_caps_sa(t_prime, &genome.sequence[..n2], temp_dir, &mut pack_one)?;
+        let t_prime: Vec<u8> =
+            build_sentinel_transformed_text(&genome.sequence.as_slice()[..n2], n_seg);
+        dispatch_caps_sa(
+            t_prime,
+            &genome.sequence.as_slice()[..n2],
+            temp_dir,
+            &mut pack_one,
+        )?;
     } else if force_sentinel && alphabet_max <= <u16 as SaSymbol>::MAX_REPRESENTABLE {
         log::info!(
             "sa_build: RUSTAR_USE_SENTINEL_TRANSFORM=1, alphabet fits u16 — \
              using sentinel-transform arm"
         );
-        let t_prime: Vec<u16> = build_sentinel_transformed_text(&genome.sequence[..n2], n_seg);
-        dispatch_caps_sa(t_prime, &genome.sequence[..n2], temp_dir, &mut pack_one)?;
+        let t_prime: Vec<u16> =
+            build_sentinel_transformed_text(&genome.sequence.as_slice()[..n2], n_seg);
+        dispatch_caps_sa(
+            t_prime,
+            &genome.sequence.as_slice()[..n2],
+            temp_dir,
+            &mut pack_one,
+        )?;
     } else {
         if force_sentinel {
             log::warn!(
@@ -387,7 +402,7 @@ where
                  alphabet_max={alphabet_max}, {n_seg} segments)"
             );
         }
-        dispatch_caps_sa_segmented(&genome.sequence[..n2], temp_dir, &mut pack_one)?;
+        dispatch_caps_sa_segmented(&genome.sequence.as_slice()[..n2], temp_dir, &mut pack_one)?;
     }
 
     debug_assert_eq!(

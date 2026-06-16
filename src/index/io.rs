@@ -186,28 +186,29 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
     let n_genome_real = chr_start[n_chr_real];
     let n_genome = read_genome_file_size(genome_dir)?.unwrap_or(n_genome_real);
 
-    // Load Genome sequence file
+    // Memory-map the Genome sequence file (forward strand only, `n_genome`
+    // bytes). The reverse-complement half is computed on access by
+    // `GenomeSeq::base`, so the ~`n_genome`-byte RC buffer is never
+    // materialized and the forward bytes are reclaimable file-backed pages
+    // rather than an anonymous `Vec`. The genome is accessed by single-byte
+    // lookups during alignment, which `base` serves from the map.
     let genome_path = genome_dir.join("Genome");
-    let genome_data = std::fs::read(&genome_path).map_err(|e| Error::io(e, &genome_path))?;
+    let file = File::open(&genome_path).map_err(|e| Error::io(e, &genome_path))?;
+    // SAFETY: Genome is opened read-only and never mutated while loaded.
+    let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| Error::io(e, &genome_path))? };
 
-    if genome_data.len() != n_genome as usize {
+    if mmap.len() != n_genome as usize {
         return Err(Error::Index(format!(
             "Genome file size mismatch: expected {} bytes, got {}",
             n_genome,
-            genome_data.len()
+            mmap.len()
         )));
     }
 
-    // Build full sequence buffer (forward + reverse complement)
-    let mut sequence = vec![5u8; (n_genome * 2) as usize];
-    sequence[..n_genome as usize].copy_from_slice(&genome_data);
-
-    // Build reverse complement
-    for i in 0..n_genome as usize {
-        let base = sequence[i];
-        let complement = if base < 4 { 3 - base } else { base };
-        sequence[2 * n_genome as usize - 1 - i] = complement;
-    }
+    let sequence = crate::genome::GenomeSeq::Mapped {
+        fwd: std::sync::Arc::new(mmap),
+        n_genome: n_genome as usize,
+    };
 
     Ok(Genome {
         sequence,

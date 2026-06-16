@@ -381,7 +381,7 @@ mod tests {
 
     fn make_genome() -> Genome {
         Genome {
-            sequence: vec![0u8; 2000],
+            sequence: vec![0u8; 2000].into(),
             n_genome: 2000,
             n_genome_real: 2000,
             n_chr_real: 2,

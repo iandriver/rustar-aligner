@@ -471,7 +471,7 @@ fn compare_seq_to_genome(
             return (match_len, true);
         }
 
-        let genome_base = index.genome.sequence[genome_idx];
+        let genome_base = index.genome.sequence.base(genome_idx);
 
         if genome_base >= 5 {
             // Padding character — STAR returns comp_res > 0 (read > genome)

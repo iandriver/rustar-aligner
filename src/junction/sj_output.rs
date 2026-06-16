@@ -523,7 +523,7 @@ mod tests {
         stats.record_junction(0, 300, 400, 2, SpliceMotif::GcAg, false, 15, true);
 
         let genome = Genome {
-            sequence: vec![0; 1000],
+            sequence: vec![0; 1000].into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,
@@ -584,7 +584,7 @@ mod tests {
         stats.record_junction(0, 300, 400, 1, SpliceMotif::GtAg, true, 20, false);
 
         let genome = Genome {
-            sequence: vec![0; 1000],
+            sequence: vec![0; 1000].into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,
@@ -619,7 +619,7 @@ mod tests {
         stats.record_junction(0, 100, 200, 1, SpliceMotif::NonCanonical, true, 2, true);
 
         let genome = Genome {
-            sequence: vec![0; 1000],
+            sequence: vec![0; 1000].into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,
@@ -697,7 +697,7 @@ mod tests {
         }
 
         let genome = Genome {
-            sequence: vec![0; 1000],
+            sequence: vec![0; 1000].into(),
             n_genome: 1000,
             n_genome_real: 1000,
             n_chr_real: 1,
