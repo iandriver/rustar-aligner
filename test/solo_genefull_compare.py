@@ -39,8 +39,11 @@ def _find(d, base):
 
 
 def load_raw(d):
-    """Return (barcodes list, dict cell_idx->total_umi, n_genes, total_umi)."""
-    bcs = [l.split("\t")[0].strip() for l in _open(_find(d, "barcodes.tsv"))]
+    """Return (barcodes list, dict cell_idx->total_umi, n_genes, total_umi).
+
+    Barcodes are normalized (10x '-1' gem-group suffix stripped) so they are
+    comparable across tools (CellRanger appends '-1', STARsolo/rustar do not)."""
+    bcs = [l.split("\t")[0].split("-")[0].strip() for l in _open(_find(d, "barcodes.tsv"))]
     genes = [l.split("\t")[0].strip() for l in _open(_find(d, "features.tsv"))]
     totals = {}
     total_umi = 0
