@@ -33,6 +33,11 @@ pub struct GeneAnnotation {
     /// Per-chromosome exon interval list, sorted by (start, end).
     /// Each entry: (start_0based_incl, end_0based_excl, gene_idx).
     pub chr_exons: Vec<Vec<(u64, u64, usize)>>,
+    /// Per-chromosome **gene-body** interval list (one entry per gene: its full
+    /// `[min exon start, max exon end)` span, covering introns), sorted by
+    /// (start, end). Used by the STARsolo `GeneFull` feature, which counts a
+    /// read overlapping the gene locus including purely intronic reads.
+    pub chr_gene_body: Vec<Vec<(u64, u64, usize)>>,
 }
 
 impl GeneAnnotation {
@@ -46,6 +51,9 @@ impl GeneAnnotation {
         let mut gene_id_to_idx: std::collections::HashMap<String, usize> =
             std::collections::HashMap::new();
         let mut chr_exons: Vec<Vec<(u64, u64, usize)>> = vec![Vec::new(); n_chrs];
+        // Per-gene full span: (chr_idx, min_start, max_end). Accumulated over all
+        // of a gene's exons to build the GeneFull gene-body intervals.
+        let mut gene_span: Vec<Option<(usize, u64, u64)>> = Vec::new();
 
         for exon in exons {
             let gene_id = match exon.attributes.get(gene_tag) {
@@ -61,6 +69,7 @@ impl GeneAnnotation {
                 let is_rev = exon.strand == '-';
                 gene_is_reverse.push(is_rev);
                 gene_ids.push(gene_id);
+                gene_span.push(None);
                 idx
             };
 
@@ -78,6 +87,15 @@ impl GeneAnnotation {
             let end = chr_offset + exon.end;
 
             chr_exons[chr_idx].push((start, end, gene_idx));
+
+            // Extend this gene's full span. (A gene's exons share one chr.)
+            match &mut gene_span[gene_idx] {
+                Some((_, s, e)) => {
+                    *s = (*s).min(start);
+                    *e = (*e).max(end);
+                }
+                slot @ None => *slot = Some((chr_idx, start, end)),
+            }
         }
 
         for exons in &mut chr_exons {
@@ -85,10 +103,22 @@ impl GeneAnnotation {
             exons.dedup();
         }
 
+        // Build the per-chromosome gene-body interval list.
+        let mut chr_gene_body: Vec<Vec<(u64, u64, usize)>> = vec![Vec::new(); n_chrs];
+        for (gene_idx, span) in gene_span.iter().enumerate() {
+            if let Some((chr_idx, s, e)) = *span {
+                chr_gene_body[chr_idx].push((s, e, gene_idx));
+            }
+        }
+        for bodies in &mut chr_gene_body {
+            bodies.sort_unstable_by_key(|&(s, e, _)| (s, e));
+        }
+
         GeneAnnotation {
             gene_ids,
             gene_is_reverse,
             chr_exons,
+            chr_gene_body,
         }
     }
 
@@ -101,13 +131,28 @@ impl GeneAnnotation {
         self.gene_ids.len()
     }
 
-    /// Return indices of all genes whose exons overlap any exon of `transcript`.
-    /// Result is sorted and deduplicated.
+    /// Return indices of all genes whose exons overlap any exon of `transcript`
+    /// (the `Gene` feature). Result is sorted and deduplicated.
     pub fn overlapping_genes(&self, transcript: &Transcript) -> Vec<usize> {
-        if transcript.chr_idx >= self.chr_exons.len() {
+        Self::overlapping_in(&self.chr_exons, transcript)
+    }
+
+    /// Return indices of all genes whose **full body** (exons + introns)
+    /// overlaps any aligned block of `transcript` (the `GeneFull` feature). A
+    /// purely intronic read therefore counts here but not in `overlapping_genes`.
+    pub fn overlapping_genes_full(&self, transcript: &Transcript) -> Vec<usize> {
+        Self::overlapping_in(&self.chr_gene_body, transcript)
+    }
+
+    /// Shared overlap query over a sorted-by-start per-chromosome interval list.
+    fn overlapping_in(
+        chr_intervals: &[Vec<(u64, u64, usize)>],
+        transcript: &Transcript,
+    ) -> Vec<usize> {
+        if transcript.chr_idx >= chr_intervals.len() {
             return Vec::new();
         }
-        let chr = &self.chr_exons[transcript.chr_idx];
+        let chr = &chr_intervals[transcript.chr_idx];
         if chr.is_empty() {
             return Vec::new();
         }
@@ -120,7 +165,7 @@ impl GeneAnnotation {
             if re <= rs {
                 continue;
             }
-            // All gene exons with start < re are candidates.
+            // All intervals with start < re are candidates.
             let upper = chr.partition_point(|&(gs, _, _)| gs < re);
             for &(_, ge, gene_idx) in &chr[..upper] {
                 // Overlap condition: ge > rs (start already guaranteed < re by upper bound).

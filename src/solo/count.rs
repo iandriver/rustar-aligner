@@ -263,6 +263,7 @@ fn resolve_multi_cb(
 #[allow(clippy::too_many_arguments)]
 fn stream_matrix(
     ctx: &SoloContext,
+    recorder: &crate::solo::SoloRecorder,
     method: UmiDedup,
     filtering: UmiFiltering,
     umi_len: usize,
@@ -282,9 +283,9 @@ fn stream_matrix(
         let mut body = std::io::BufWriter::new(body_tmp.as_file_mut());
 
         // Move records out of the recorder; fold in resolved 1MM_multi cells.
-        let mut records = std::mem::take(&mut *ctx.recorder.records.lock().unwrap());
+        let mut records = std::mem::take(&mut *recorder.records.lock().unwrap());
         let exact_counts = ctx.whitelist.exact_count_snapshot();
-        let multi = std::mem::take(&mut *ctx.recorder.multi_records.lock().unwrap());
+        let multi = std::mem::take(&mut *recorder.multi_records.lock().unwrap());
         for m in &multi {
             if let Some(cb) = resolve_multi_cb(&m.candidates, &exact_counts, pseudocount) {
                 records.push(SoloCountRecord {
@@ -411,15 +412,11 @@ pub fn write_gene_matrix(
     };
     let umi_len = params.solo_umi_len as usize;
 
-    // Output directory: {prefix}{soloOutFileNames[0]}Gene/raw/
     let solo_dir = params
         .solo_out_file_names
         .first()
         .cloned()
         .unwrap_or_else(|| "Solo.out/".to_string());
-    let raw_dir = params.output_path(&format!("{solo_dir}Gene/raw/"));
-    std::fs::create_dir_all(&raw_dir).map_err(|e| Error::io(e, &raw_dir))?;
-
     let features_name = params
         .solo_out_file_names
         .get(1)
@@ -436,26 +433,35 @@ pub fn write_gene_matrix(
         .cloned()
         .unwrap_or_else(|| "matrix.mtx".to_string());
 
-    write_features(&raw_dir.join(&features_name), &ctx.gene_ann.gene_ids)?;
-    write_barcodes(&raw_dir.join(&barcodes_name), &ctx.whitelist, sorted.len())?;
-    let n_entries = stream_matrix(
-        ctx,
-        method,
-        filtering,
-        umi_len,
-        pseudocount,
-        &raw_dir.join(&matrix_name),
-        ctx.gene_ann.gene_ids.len(),
-        sorted.len(),
-    )?;
+    // One {prefix}{soloOutFileNames[0]}<feature>/raw/ directory per feature
+    // (Gene, GeneFull, …), each fed from its own recorder.
+    for (feature, recorder) in ctx.features.iter().zip(&ctx.recorders) {
+        let raw_dir = params.output_path(&format!("{solo_dir}{}/raw/", feature.dir_name()));
+        std::fs::create_dir_all(&raw_dir).map_err(|e| Error::io(e, &raw_dir))?;
 
-    log::info!(
-        "STARsolo: wrote Gene/raw matrix to {} ({} genes × {} barcodes, {} entries)",
-        raw_dir.display(),
-        ctx.gene_ann.gene_ids.len(),
-        sorted.len(),
-        n_entries,
-    );
+        write_features(&raw_dir.join(&features_name), &ctx.gene_ann.gene_ids)?;
+        write_barcodes(&raw_dir.join(&barcodes_name), &ctx.whitelist, sorted.len())?;
+        let n_entries = stream_matrix(
+            ctx,
+            recorder,
+            method,
+            filtering,
+            umi_len,
+            pseudocount,
+            &raw_dir.join(&matrix_name),
+            ctx.gene_ann.gene_ids.len(),
+            sorted.len(),
+        )?;
+
+        log::info!(
+            "STARsolo: wrote {}/raw matrix to {} ({} genes × {} barcodes, {} entries)",
+            feature.dir_name(),
+            raw_dir.display(),
+            ctx.gene_ann.gene_ids.len(),
+            sorted.len(),
+            n_entries,
+        );
+    }
     Ok(())
 }
 

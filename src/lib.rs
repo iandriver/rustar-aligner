@@ -368,12 +368,15 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
             s.n_in_umi.load(Ordering::Relaxed),
             s.umi_homopolymer.load(Ordering::Relaxed),
         );
-        info!(
-            "STARsolo: collected {} resolved (CB,UMI,gene) records ({} deferred 1MM_multi)",
-            sctx.recorder.n_records(),
-            sctx.recorder.n_multi_records(),
-        );
-        // Write the raw count matrix (Gene/raw/{matrix.mtx,barcodes.tsv,features.tsv}).
+        for (feature, recorder) in sctx.features.iter().zip(&sctx.recorders) {
+            info!(
+                "STARsolo {}: collected {} resolved (CB,UMI,gene) records ({} deferred 1MM_multi)",
+                feature.dir_name(),
+                recorder.n_records(),
+                recorder.n_multi_records(),
+            );
+        }
+        // Write the raw count matrix per feature ({feature}/raw/{matrix.mtx,...}).
         crate::solo::write_gene_matrix(sctx, &params)?;
     }
 
@@ -1436,11 +1439,10 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     let max_multimaps = params.out_filter_multimap_nmax as usize;
     let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
 
-    /// Per-read result for the solo loop.
+    /// Per-read result for the solo loop (one outcome per quantified feature).
     struct SoloReadProduct {
         sam_records: BufferedSamRecords,
-        record: Option<SoloCountRecord>,
-        multi: Option<SoloMultiRecord>,
+        per_feature: Vec<crate::solo::FeatureOutcome>,
     }
 
     info!("STARsolo: aligning cDNA reads and quantifying barcodes...");
@@ -1483,8 +1485,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     let outcome = solo.process_read(&[], sread.barcode.as_ref());
                     return Ok(SoloReadProduct {
                         sam_records: buffer,
-                        record: outcome.record,
-                        multi: outcome.multi,
+                        per_feature: outcome.per_feature,
                     });
                 }
 
@@ -1542,26 +1543,33 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
 
                 Ok(SoloReadProduct {
                     sam_records: buffer,
-                    record: outcome.record,
-                    multi: outcome.multi,
+                    per_feature: outcome.per_feature,
                 })
             })
             .collect();
 
-        // Sequential write + record collection.
-        let mut batch_records: Vec<SoloCountRecord> = Vec::new();
-        let mut batch_multi: Vec<SoloMultiRecord> = Vec::new();
+        // Sequential write + per-feature record collection.
+        let n_feat = solo.features.len();
+        let mut feat_records: Vec<Vec<SoloCountRecord>> = (0..n_feat).map(|_| Vec::new()).collect();
+        let mut feat_multi: Vec<Vec<SoloMultiRecord>> = (0..n_feat).map(|_| Vec::new()).collect();
         for result in batch_results {
             let product = result?;
             writer.write_batch(&product.sam_records.records)?;
-            if let Some(r) = product.record {
-                batch_records.push(r);
-            }
-            if let Some(m) = product.multi {
-                batch_multi.push(m);
+            for (fi, fo) in product.per_feature.into_iter().enumerate() {
+                if let Some(r) = fo.record {
+                    feat_records[fi].push(r);
+                }
+                if let Some(m) = fo.multi {
+                    feat_multi[fi].push(m);
+                }
             }
         }
-        solo.recorder.extend(batch_records, batch_multi);
+        for (fi, recorder) in solo.recorders.iter().enumerate() {
+            recorder.extend(
+                std::mem::take(&mut feat_records[fi]),
+                std::mem::take(&mut feat_multi[fi]),
+            );
+        }
 
         read_count += reads_to_process as u64;
         if read_count % 100_000 < batch_size as u64 {

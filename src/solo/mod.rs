@@ -14,7 +14,7 @@ pub mod gene;
 pub mod whitelist;
 
 pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};
-pub use gene::{GeneAssignment, SoloStrand, assign_gene_se};
+pub use gene::{GeneAssignment, SoloFeature, SoloStrand, assign_gene_se};
 pub use whitelist::{
     CbCandidate, CbMatch, CbMatchStats, CbMatchType, CbWhitelist, UmiCheck, check_umi, pack_barcode,
 };
@@ -345,12 +345,22 @@ pub struct SoloContext {
     pub strand: SoloStrand,
     pub gene_ann: GeneAnnotation,
     pub stats: CbMatchStats,
-    pub recorder: SoloRecorder,
+    /// Quantified features (`Gene`, `GeneFull`, …), each with its own recorder
+    /// and `Solo.out/<feature>/raw/` output. Parallel to `recorders`.
+    pub features: Vec<SoloFeature>,
+    pub recorders: Vec<SoloRecorder>,
 }
 
-/// What happened to one solo read — drives the produced record(s) and stats.
+/// What happened to one solo read — one `(record, multi)` per quantified
+/// feature, parallel to [`SoloContext::features`].
 #[derive(Debug, Default)]
 pub struct SoloReadOutcome {
+    pub per_feature: Vec<FeatureOutcome>,
+}
+
+/// The record(s) one read produces for a single feature.
+#[derive(Debug, Default)]
+pub struct FeatureOutcome {
     /// A resolved count record, if the read was fully assignable.
     pub record: Option<SoloCountRecord>,
     /// A deferred multi-CB record, if the CB was an unresolved 1MM_multi.
@@ -403,6 +413,20 @@ impl SoloContext {
             Error::from(std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
         })?;
 
+        // Quantified gene features (Gene, GeneFull). Validation guarantees these
+        // parse; default to Gene if somehow empty.
+        let features: Vec<SoloFeature> = params
+            .solo_features
+            .iter()
+            .filter_map(|f| f.parse().ok())
+            .collect();
+        let features = if features.is_empty() {
+            vec![SoloFeature::Gene]
+        } else {
+            features
+        };
+        let recorders = features.iter().map(|_| SoloRecorder::new()).collect();
+
         Ok(Self {
             layout: SoloBarcodeLayout::from_params(params),
             whitelist,
@@ -410,7 +434,8 @@ impl SoloContext {
             strand,
             gene_ann,
             stats: CbMatchStats::new(),
-            recorder: SoloRecorder::new(),
+            features,
+            recorders,
         })
     }
 
@@ -453,27 +478,35 @@ impl SoloContext {
             }
         };
 
-        // Gene assignment (only counted reads produce records).
-        let gene = match assign_gene_se(cdna_transcripts, &self.gene_ann, self.strand) {
-            GeneAssignment::Gene(g) => g,
-            GeneAssignment::NoFeature | GeneAssignment::Ambiguous | GeneAssignment::Unmapped => {
-                return out;
-            }
-        };
-
-        match (cb_resolved, &cb_match) {
-            (Some(cb), _) => {
-                out.record = Some(SoloCountRecord { cb, umi, gene });
-            }
-            (None, CbMatch::Multi(cands)) => {
-                out.multi = Some(SoloMultiRecord {
-                    candidates: cands.clone(),
-                    umi,
-                    gene,
-                });
-            }
-            (None, _) => unreachable!("non-multi unresolved CB returned early"),
-        }
+        // The CB match + UMI are shared across features; only gene assignment
+        // differs (exonic Gene vs gene-body GeneFull). Produce one outcome per
+        // feature.
+        out.per_feature = self
+            .features
+            .iter()
+            .map(|&feature| {
+                let mut fo = FeatureOutcome::default();
+                let gene =
+                    match assign_gene_se(cdna_transcripts, &self.gene_ann, self.strand, feature) {
+                        GeneAssignment::Gene(g) => g,
+                        GeneAssignment::NoFeature
+                        | GeneAssignment::Ambiguous
+                        | GeneAssignment::Unmapped => return fo,
+                    };
+                match (cb_resolved, &cb_match) {
+                    (Some(cb), _) => fo.record = Some(SoloCountRecord { cb, umi, gene }),
+                    (None, CbMatch::Multi(cands)) => {
+                        fo.multi = Some(SoloMultiRecord {
+                            candidates: cands.clone(),
+                            umi,
+                            gene,
+                        });
+                    }
+                    (None, _) => unreachable!("non-multi unresolved CB returned early"),
+                }
+                fo
+            })
+            .collect();
         out
     }
 }

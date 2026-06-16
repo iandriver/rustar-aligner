@@ -38,6 +38,39 @@ impl FromStr for SoloStrand {
     }
 }
 
+/// A STARsolo `--soloFeatures` value that quantifies genes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SoloFeature {
+    /// Exonic counting: a read counts toward a gene only if it overlaps an exon.
+    Gene,
+    /// Full gene-body counting (CellRanger `include-introns`): a read counts if
+    /// it overlaps the gene locus, including purely intronic reads.
+    GeneFull,
+}
+
+impl SoloFeature {
+    /// Output sub-directory name (`Solo.out/<dir>/raw/`).
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            SoloFeature::Gene => "Gene",
+            SoloFeature::GeneFull => "GeneFull",
+        }
+    }
+}
+
+impl FromStr for SoloFeature {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "Gene" => Ok(Self::Gene),
+            "GeneFull" => Ok(Self::GeneFull),
+            _ => Err(format!(
+                "unsupported soloFeature '{s}'; supported: Gene, GeneFull"
+            )),
+        }
+    }
+}
+
 /// Outcome of assigning a read to a gene.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GeneAssignment {
@@ -61,11 +94,13 @@ fn strand_keeps(strand: SoloStrand, gene_is_reverse: bool, read_is_reverse: bool
     }
 }
 
-/// Assign a single-end (cDNA) read to a gene from its alignment set.
+/// Assign a single-end (cDNA) read to a gene from its alignment set, using the
+/// `Gene` (exonic) or `GeneFull` (gene-body, intron-inclusive) overlap basis.
 pub fn assign_gene_se(
     transcripts: &[Transcript],
     gene_ann: &GeneAnnotation,
     strand: SoloStrand,
+    feature: SoloFeature,
 ) -> GeneAssignment {
     if transcripts.is_empty() {
         return GeneAssignment::Unmapped;
@@ -73,7 +108,11 @@ pub fn assign_gene_se(
 
     let mut genes: Vec<usize> = Vec::new();
     for tr in transcripts {
-        for g in gene_ann.overlapping_genes(tr) {
+        let overlapping = match feature {
+            SoloFeature::Gene => gene_ann.overlapping_genes(tr),
+            SoloFeature::GeneFull => gene_ann.overlapping_genes_full(tr),
+        };
+        for g in overlapping {
             if strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse) {
                 genes.push(g);
             }
@@ -157,7 +196,7 @@ mod tests {
     fn unmapped_when_no_transcripts() {
         let ann = annotation();
         assert_eq!(
-            assign_gene_se(&[], &ann, SoloStrand::Forward),
+            assign_gene_se(&[], &ann, SoloStrand::Forward, SoloFeature::Gene),
             GeneAssignment::Unmapped
         );
     }
@@ -167,7 +206,7 @@ mod tests {
         let ann = annotation();
         // Read on + strand overlapping G1 (a + gene).
         let tr = read_at(120, 180, false);
-        match assign_gene_se(&[tr], &ann, SoloStrand::Forward) {
+        match assign_gene_se(&[tr], &ann, SoloStrand::Forward, SoloFeature::Gene) {
             GeneAssignment::Gene(g) => assert_eq!(ann.gene_ids[g as usize], "G1"),
             other => panic!("expected G1, got {other:?}"),
         }
@@ -179,7 +218,7 @@ mod tests {
         // Read on - strand overlapping G1 (+): wrong strand under Forward.
         let tr = read_at(120, 180, true);
         assert_eq!(
-            assign_gene_se(&[tr], &ann, SoloStrand::Forward),
+            assign_gene_se(&[tr], &ann, SoloStrand::Forward, SoloFeature::Gene),
             GeneAssignment::NoFeature
         );
     }
@@ -189,7 +228,7 @@ mod tests {
         let ann = annotation();
         // Read on - strand overlapping G1 (+): kept under Reverse.
         let tr = read_at(120, 180, true);
-        match assign_gene_se(&[tr], &ann, SoloStrand::Reverse) {
+        match assign_gene_se(&[tr], &ann, SoloStrand::Reverse, SoloFeature::Gene) {
             GeneAssignment::Gene(g) => assert_eq!(ann.gene_ids[g as usize], "G1"),
             other => panic!("expected G1 under Reverse, got {other:?}"),
         }
@@ -200,7 +239,7 @@ mod tests {
         let ann = annotation();
         let tr = read_at(500, 600, false);
         assert_eq!(
-            assign_gene_se(&[tr], &ann, SoloStrand::Unstranded),
+            assign_gene_se(&[tr], &ann, SoloStrand::Unstranded, SoloFeature::Gene),
             GeneAssignment::NoFeature
         );
     }
@@ -211,7 +250,7 @@ mod tests {
         // Two loci both inside G1 → still gene-unique.
         let a = read_at(110, 150, false);
         let b = read_at(150, 190, false);
-        match assign_gene_se(&[a, b], &ann, SoloStrand::Forward) {
+        match assign_gene_se(&[a, b], &ann, SoloStrand::Forward, SoloFeature::Gene) {
             GeneAssignment::Gene(g) => assert_eq!(ann.gene_ids[g as usize], "G1"),
             other => panic!("expected G1, got {other:?}"),
         }
@@ -224,8 +263,37 @@ mod tests {
         let a = read_at(120, 180, false);
         let b = read_at(320, 380, true);
         assert_eq!(
-            assign_gene_se(&[a, b], &ann, SoloStrand::Unstranded),
+            assign_gene_se(&[a, b], &ann, SoloStrand::Unstranded, SoloFeature::Gene),
             GeneAssignment::Ambiguous
         );
+    }
+
+    #[test]
+    fn genefull_counts_intronic_read() {
+        // Two-exon gene G3 (+): exons [500,600) and [800,900) → gene body
+        // [500,900) with an intron at [600,800).
+        let g = genome();
+        let exons = vec![gtf_exon(501, 600, '+', "G3"), gtf_exon(801, 900, '+', "G3")];
+        let ann = GeneAnnotation::from_gtf_exons(&exons, &g);
+        // A read entirely inside the intron overlaps no exon...
+        assert_eq!(
+            assign_gene_se(
+                &[read_at(650, 700, false)],
+                &ann,
+                SoloStrand::Forward,
+                SoloFeature::Gene
+            ),
+            GeneAssignment::NoFeature
+        );
+        // ...but does overlap the gene body, so GeneFull counts it.
+        match assign_gene_se(
+            &[read_at(650, 700, false)],
+            &ann,
+            SoloStrand::Forward,
+            SoloFeature::GeneFull,
+        ) {
+            GeneAssignment::Gene(gi) => assert_eq!(ann.gene_ids[gi as usize], "G3"),
+            other => panic!("expected G3 under GeneFull, got {other:?}"),
+        }
     }
 }

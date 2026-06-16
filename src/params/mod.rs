@@ -1058,13 +1058,17 @@ impl Parameters {
                     ),
                 ));
             }
+            // Only Gene / GeneFull are implemented (SJ, Velocyto, … are not yet).
+            for f in &params.solo_features {
+                if f.parse::<crate::solo::SoloFeature>().is_err() {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!("unsupported --soloFeatures '{f}'; supported: Gene, GeneFull"),
+                    ));
+                }
+            }
             // Gene-level features need a gene model.
-            if params
-                .solo_features
-                .iter()
-                .any(|f| f == "Gene" || f == "GeneFull")
-                && params.sjdb_gtf_file.is_none()
-            {
+            if !params.solo_features.is_empty() && params.sjdb_gtf_file.is_none() {
                 return Err(command.error(
                     ErrorKind::MissingRequiredArgument,
                     "--soloFeatures Gene/GeneFull requires --sjdbGTFfile (a gene model)",
