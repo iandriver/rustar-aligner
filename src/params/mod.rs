@@ -792,6 +792,14 @@ impl Parameters {
         PathBuf::from(format!("{}{suffix}", self.out_file_name_prefix))
     }
 
+    /// Whether the run produces per-read alignment records (SAM/BAM). False only
+    /// for `--outSAMtype None` written to a file (no `--outStd`): the alignment
+    /// loops then skip building SAM records entirely, which is a large saving for
+    /// solo / quant-only runs that only need the count matrix.
+    pub fn emits_alignments(&self) -> bool {
+        !matches!(self.out_std, OutStd::None) || self.out_sam_type.format != OutSamFormat::None
+    }
+
     /// Whether `--chimOutType` includes `Junctions` (write Chimeric.out.junction).
     pub fn chim_out_junctions(&self) -> bool {
         self.chim_out_type.iter().any(|s| s == "Junctions")

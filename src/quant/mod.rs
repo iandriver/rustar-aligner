@@ -134,30 +134,46 @@ impl GeneAnnotation {
     /// Return indices of all genes whose exons overlap any exon of `transcript`
     /// (the `Gene` feature). Result is sorted and deduplicated.
     pub fn overlapping_genes(&self, transcript: &Transcript) -> Vec<usize> {
-        Self::overlapping_in(&self.chr_exons, transcript)
+        let mut out = Vec::new();
+        self.overlapping_genes_into(transcript, &mut out);
+        out
     }
 
     /// Return indices of all genes whose **full body** (exons + introns)
     /// overlaps any aligned block of `transcript` (the `GeneFull` feature). A
     /// purely intronic read therefore counts here but not in `overlapping_genes`.
     pub fn overlapping_genes_full(&self, transcript: &Transcript) -> Vec<usize> {
-        Self::overlapping_in(&self.chr_gene_body, transcript)
+        let mut out = Vec::new();
+        self.overlapping_genes_full_into(transcript, &mut out);
+        out
     }
 
-    /// Shared overlap query over a sorted-by-start per-chromosome interval list.
-    fn overlapping_in(
+    /// `overlapping_genes` into a caller-provided buffer (cleared + sorted/deduped
+    /// here). Lets the per-read hot path reuse one scratch `Vec` across reads.
+    pub fn overlapping_genes_into(&self, transcript: &Transcript, out: &mut Vec<usize>) {
+        Self::overlapping_in_into(&self.chr_exons, transcript, out);
+    }
+
+    /// `overlapping_genes_full` into a caller-provided buffer.
+    pub fn overlapping_genes_full_into(&self, transcript: &Transcript, out: &mut Vec<usize>) {
+        Self::overlapping_in_into(&self.chr_gene_body, transcript, out);
+    }
+
+    /// Shared overlap query over a sorted-by-start per-chromosome interval list,
+    /// writing sorted/deduped gene indices into `out` (which is cleared first).
+    fn overlapping_in_into(
         chr_intervals: &[Vec<(u64, u64, usize)>],
         transcript: &Transcript,
-    ) -> Vec<usize> {
+        out: &mut Vec<usize>,
+    ) {
+        out.clear();
         if transcript.chr_idx >= chr_intervals.len() {
-            return Vec::new();
+            return;
         }
         let chr = &chr_intervals[transcript.chr_idx];
         if chr.is_empty() {
-            return Vec::new();
+            return;
         }
-
-        let mut genes: Vec<usize> = Vec::new();
 
         for exon in &transcript.exons {
             let rs = exon.genome_start;
@@ -170,14 +186,13 @@ impl GeneAnnotation {
             for &(_, ge, gene_idx) in &chr[..upper] {
                 // Overlap condition: ge > rs (start already guaranteed < re by upper bound).
                 if ge > rs {
-                    genes.push(gene_idx);
+                    out.push(gene_idx);
                 }
             }
         }
 
-        genes.sort_unstable();
-        genes.dedup();
-        genes
+        out.sort_unstable();
+        out.dedup();
     }
 }
 

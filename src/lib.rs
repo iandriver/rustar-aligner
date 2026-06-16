@@ -498,7 +498,8 @@ fn run_single_pass(
                 }
             }
             OutSamFormat::None => {
-                anyhow::bail!("Output format 'None' not yet implemented");
+                info!("--outSAMtype None: skipping alignment output (count/quant only)");
+                Box::new(NullWriter)
             }
         },
     };
@@ -1020,7 +1021,9 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
     let clip5p = params.clip5p_nbases as usize;
     let clip3p = params.clip3p_nbases as usize;
     let max_multimaps = params.out_filter_multimap_nmax as usize;
-    let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
+    // `--outSAMtype None` (e.g. quant-only) skips building SAM records.
+    let emit_sam = params.emits_alignments();
+    let output_unmapped = emit_sam && params.out_sam_unmapped != params::OutSamUnmapped::None;
     let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
     let by_sjout = params.out_filter_type == OutFilterType::BySJout;
 
@@ -1166,36 +1169,39 @@ fn align_reads_single_end<W: AlignmentWriter + ?Sized>(
                         Vec::new()
                     };
 
-                // Build SAM records (no I/O, just construction)
+                // Build SAM records (no I/O, just construction).
+                // Skipped entirely under `--outSAMtype None`.
                 let is_unmapped_se = transcripts.is_empty();
-                if is_unmapped_se {
-                    // Unmapped
-                    if output_unmapped {
-                        let record = SamWriter::build_unmapped_record(
+                if emit_sam {
+                    if is_unmapped_se {
+                        // Unmapped
+                        if output_unmapped {
+                            let record = SamWriter::build_unmapped_record(
+                                &read.name,
+                                &clipped_seq,
+                                &clipped_qual,
+                                params,
+                                unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                            )?;
+                            buffer.push(record);
+                        }
+                    } else if transcripts.len() <= max_multimaps {
+                        // Mapped (within multimap limit)
+                        let records = SamWriter::build_alignment_records(
                             &read.name,
                             &clipped_seq,
                             &clipped_qual,
+                            &transcripts,
+                            &index.genome,
                             params,
-                            unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                            n_for_mapq,
                         )?;
-                        buffer.push(record);
+                        for record in records {
+                            buffer.push(record);
+                        }
                     }
-                } else if transcripts.len() <= max_multimaps {
-                    // Mapped (within multimap limit)
-                    let records = SamWriter::build_alignment_records(
-                        &read.name,
-                        &clipped_seq,
-                        &clipped_qual,
-                        &transcripts,
-                        &index.genome,
-                        params,
-                        n_for_mapq,
-                    )?;
-                    for record in records {
-                        buffer.push(record);
-                    }
+                    // else: too many loci, skip output
                 }
-                // else: too many loci, skip output
 
                 // Transcriptome SAM projection for --quantMode TranscriptomeSAM.
                 let transcriptome_records: Vec<noodles::sam::alignment::record_buf::RecordBuf> =
@@ -1437,7 +1443,10 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     let clip3p = params.clip3p_nbases as usize;
     let cr4_clip = params.clip_adapter_type == "CellRanger4";
     let max_multimaps = params.out_filter_multimap_nmax as usize;
-    let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
+    // With `--outSAMtype None` (count-only) we skip building SAM records entirely
+    // — a large saving for solo runs that only need the count matrix.
+    let emit_sam = params.emits_alignments();
+    let output_unmapped = emit_sam && params.out_sam_unmapped != params::OutSamUnmapped::None;
 
     /// Per-read result for the solo loop (one outcome per quantified feature).
     struct SoloReadProduct {
@@ -1515,29 +1524,32 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                 let outcome = solo.process_read(&transcripts, sread.barcode.as_ref());
 
                 // Build SAM records for the cDNA alignment (same as SE path).
-                if transcripts.is_empty() {
-                    if output_unmapped {
-                        let record = SamWriter::build_unmapped_record(
+                // Skipped entirely under `--outSAMtype None` (count-only).
+                if emit_sam {
+                    if transcripts.is_empty() {
+                        if output_unmapped {
+                            let record = SamWriter::build_unmapped_record(
+                                &read.name,
+                                &clipped_seq,
+                                &clipped_qual,
+                                params,
+                                unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                            )?;
+                            buffer.push(record);
+                        }
+                    } else if transcripts.len() <= max_multimaps {
+                        let records = SamWriter::build_alignment_records(
                             &read.name,
                             &clipped_seq,
                             &clipped_qual,
+                            &transcripts,
+                            &index.genome,
                             params,
-                            unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                            n_for_mapq,
                         )?;
-                        buffer.push(record);
-                    }
-                } else if transcripts.len() <= max_multimaps {
-                    let records = SamWriter::build_alignment_records(
-                        &read.name,
-                        &clipped_seq,
-                        &clipped_qual,
-                        &transcripts,
-                        &index.genome,
-                        params,
-                        n_for_mapq,
-                    )?;
-                    for record in records {
-                        buffer.push(record);
+                        for record in records {
+                            buffer.push(record);
+                        }
                     }
                 }
 
@@ -1644,7 +1656,9 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
     let clip5p = params.clip5p_nbases as usize;
     let clip3p = params.clip3p_nbases as usize;
     let max_multimaps = params.out_filter_multimap_nmax as usize;
-    let output_unmapped = params.out_sam_unmapped != params::OutSamUnmapped::None;
+    // `--outSAMtype None` (e.g. quant-only) skips building SAM records.
+    let emit_sam = params.emits_alignments();
+    let output_unmapped = emit_sam && params.out_sam_unmapped != params::OutSamUnmapped::None;
     let write_unmapped_fastq = params.out_reads_unmapped == params::OutReadsUnmapped::Fastx;
     let by_sjout = params.out_filter_type == OutFilterType::BySJout;
 
@@ -1883,8 +1897,10 @@ fn align_reads_paired_end<W: AlignmentWriter + ?Sized>(
                     Vec::new()
                 };
 
-                // Build SAM records
-                if results.is_empty() {
+                // Build SAM records (skipped entirely under `--outSAMtype None`).
+                if !emit_sam {
+                    // count/quant-only: no SAM record construction
+                } else if results.is_empty() {
                     // Unmapped pair
                     if output_unmapped {
                         let records = SamWriter::build_paired_unmapped_records(

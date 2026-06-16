@@ -10,6 +10,7 @@
 
 use crate::align::transcript::Transcript;
 use crate::quant::GeneAnnotation;
+use std::cell::RefCell;
 use std::str::FromStr;
 
 /// `--soloStrand`: orientation of the cDNA read relative to its gene.
@@ -106,26 +107,41 @@ pub fn assign_gene_se(
         return GeneAssignment::Unmapped;
     }
 
-    let mut genes: Vec<usize> = Vec::new();
-    for tr in transcripts {
-        let overlapping = match feature {
-            SoloFeature::Gene => gene_ann.overlapping_genes(tr),
-            SoloFeature::GeneFull => gene_ann.overlapping_genes_full(tr),
-        };
-        for g in overlapping {
-            if strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse) {
-                genes.push(g);
-            }
-        }
+    // Reuse per-thread scratch buffers: this runs once per feature per read
+    // (twice/read for `Gene GeneFull`), so a fresh Vec each call is pure churn.
+    thread_local! {
+        static OVERLAP_BUF: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        static GENES_BUF: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     }
-    genes.sort_unstable();
-    genes.dedup();
 
-    match genes.len() {
-        0 => GeneAssignment::NoFeature,
-        1 => GeneAssignment::Gene(genes[0] as u32),
-        _ => GeneAssignment::Ambiguous,
-    }
+    OVERLAP_BUF.with(|ob| {
+        GENES_BUF.with(|gb| {
+            let mut overlap = ob.borrow_mut();
+            let mut genes = gb.borrow_mut();
+            genes.clear();
+            for tr in transcripts {
+                match feature {
+                    SoloFeature::Gene => gene_ann.overlapping_genes_into(tr, &mut overlap),
+                    SoloFeature::GeneFull => {
+                        gene_ann.overlapping_genes_full_into(tr, &mut overlap);
+                    }
+                }
+                for &g in overlap.iter() {
+                    if strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse) {
+                        genes.push(g);
+                    }
+                }
+            }
+            genes.sort_unstable();
+            genes.dedup();
+
+            match genes.len() {
+                0 => GeneAssignment::NoFeature,
+                1 => GeneAssignment::Gene(genes[0] as u32),
+                _ => GeneAssignment::Ambiguous,
+            }
+        })
+    })
 }
 
 #[cfg(test)]
