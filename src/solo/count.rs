@@ -261,6 +261,25 @@ fn resolve_multi_cb(
 /// Records are sorted by cb (ascending column), and each cell's genes are
 /// emitted ascending, so entries come out in the same order as before.
 #[allow(clippy::too_many_arguments)]
+/// Per-cell summary collected while streaming the matrix: reads (records before
+/// UMI dedup), UMIs (deduped column sum), and genes detected (nonzero entries).
+#[derive(Clone, Copy)]
+pub struct CellStat {
+    pub n_reads: u64,
+    pub n_umis: u64,
+    pub n_genes: u32,
+}
+
+/// What `stream_matrix` returns alongside the written matrix.
+pub struct MatrixStats {
+    pub nnz: usize,
+    /// One entry per barcode that received ≥1 UMI (the raw, unfiltered set).
+    pub cells: Vec<CellStat>,
+    /// Distinct genes with a nonzero count anywhere in the raw matrix.
+    pub genes_detected: u32,
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stream_matrix(
     ctx: &SoloContext,
     recorder: &crate::solo::SoloRecorder,
@@ -271,13 +290,15 @@ fn stream_matrix(
     matrix_path: &Path,
     n_features: usize,
     n_barcodes: usize,
-) -> Result<usize, Error> {
+) -> Result<MatrixStats, Error> {
     let dir = matrix_path.parent().unwrap_or_else(|| Path::new("."));
     let mut body_tmp = tempfile::Builder::new()
         .prefix(".matrix_body")
         .tempfile_in(dir)
         .map_err(|e| Error::io(e, dir))?;
     let mut nnz = 0usize;
+    let mut cell_stats: Vec<CellStat> = Vec::new();
+    let mut gene_seen = vec![false; n_features];
 
     {
         let mut body = std::io::BufWriter::new(body_tmp.as_file_mut());
@@ -334,10 +355,24 @@ fn stream_matrix(
                 }
             }
             cell_entries.sort_unstable_by_key(|&(g, _)| g);
+            // Per-cell summary: reads = records (j-i), genes = nonzero entries,
+            // UMIs = sum of deduped counts.
+            let n_reads = (j - i) as u64;
+            let n_genes = cell_entries.len() as u32;
+            let mut n_umis = 0u64;
             for (g, c) in cell_entries {
+                n_umis += c;
+                gene_seen[g as usize] = true;
                 writeln!(body, "{} {} {}", g + 1, cb + 1, c)
                     .map_err(|e| Error::io(e, matrix_path))?;
                 nnz += 1;
+            }
+            if n_umis > 0 {
+                cell_stats.push(CellStat {
+                    n_reads,
+                    n_umis,
+                    n_genes,
+                });
             }
 
             i = j;
@@ -356,7 +391,12 @@ fn stream_matrix(
     let mut body_read = body_tmp.reopen().map_err(|e| Error::io(e, matrix_path))?;
     std::io::copy(&mut body_read, &mut out).map_err(|e| Error::io(e, matrix_path))?;
     out.flush().map_err(|e| Error::io(e, matrix_path))?;
-    Ok(nnz)
+    let genes_detected = gene_seen.iter().filter(|&&s| s).count() as u32;
+    Ok(MatrixStats {
+        nnz,
+        cells: cell_stats,
+        genes_detected,
+    })
 }
 
 /// Apply `--soloUMIfiltering` to the gene→read_count map of a single UMI,
@@ -379,11 +419,36 @@ fn filter_multi_gene_umi(genes: &HashMap<u32, u32>, filtering: UmiFiltering) -> 
     }
 }
 
-/// Write the raw gene-count matrix for a finished solo run. No-op (with a
-/// warning) when there is no explicit whitelist, which 14.4 does not support.
+/// CellRanger-2.2 knee threshold on per-barcode UMI totals (STARsolo's default
+/// `--soloCellFilter CellRanger2.2 3000 0.99 10`). Returns the minimum UMI count
+/// for a barcode to be called a cell.
+fn knee_cr22(umis_desc: &[u64], n_expected: usize, max_pct: f64, max_min_ratio: f64) -> u64 {
+    if umis_desc.is_empty() {
+        return 0;
+    }
+    let idx = ((n_expected as f64 * (1.0 - max_pct)).round() as usize).min(umis_desc.len() - 1);
+    let robust_max = umis_desc[idx] as f64;
+    (robust_max / max_min_ratio).ceil() as u64
+}
+
+/// Median of an ascending-sorted slice (0 if empty).
+fn median_sorted(sorted: &[u64]) -> u64 {
+    let n = sorted.len();
+    if n == 0 {
+        0
+    } else if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        u64::midpoint(sorted[n / 2 - 1], sorted[n / 2])
+    }
+}
+
+/// Write the raw gene-count matrix + `Summary.csv` for a finished solo run.
+/// No-op (with a warning) when there is no explicit whitelist.
 pub fn write_gene_matrix(
     ctx: &SoloContext,
     params: &crate::params::Parameters,
+    align_stats: &crate::stats::AlignmentStats,
 ) -> Result<(), Error> {
     let CbWhitelist::List { sorted, .. } = &ctx.whitelist else {
         log::warn!(
@@ -433,15 +498,35 @@ pub fn write_gene_matrix(
         .cloned()
         .unwrap_or_else(|| "matrix.mtx".to_string());
 
+    // Global mapping funnel (shared across features). `feature_reads` counts
+    // reads uniquely assigned to a gene under each feature, so exonic = Gene,
+    // genic = GeneFull, intronic = genic − exonic, intergenic = mapped − genic.
+    use std::sync::atomic::Ordering;
+    let total_reads = align_stats.total_reads.load(Ordering::Relaxed);
+    let mapped_unique = align_stats.uniquely_mapped.load(Ordering::Relaxed);
+    let mapped_multi = align_stats.multi_mapped.load(Ordering::Relaxed);
+    let valid_barcodes = ctx.stats.yes_exact.load(Ordering::Relaxed)
+        + ctx.stats.yes_one_mm.load(Ordering::Relaxed)
+        + ctx.stats.yes_mult_mm.load(Ordering::Relaxed);
+    let reads_of = |f: crate::solo::SoloFeature| -> Option<u64> {
+        ctx.features
+            .iter()
+            .position(|&x| x == f)
+            .map(|i| ctx.feature_reads[i].load(Ordering::Relaxed))
+    };
+    let exonic = reads_of(crate::solo::SoloFeature::Gene);
+    let genic = reads_of(crate::solo::SoloFeature::GeneFull);
+
     // One {prefix}{soloOutFileNames[0]}<feature>/raw/ directory per feature
     // (Gene, GeneFull, …), each fed from its own recorder.
     for (feature, recorder) in ctx.features.iter().zip(&ctx.recorders) {
-        let raw_dir = params.output_path(&format!("{solo_dir}{}/raw/", feature.dir_name()));
+        let feature_dir = params.output_path(&format!("{solo_dir}{}/", feature.dir_name()));
+        let raw_dir = feature_dir.join("raw");
         std::fs::create_dir_all(&raw_dir).map_err(|e| Error::io(e, &raw_dir))?;
 
         write_features(&raw_dir.join(&features_name), &ctx.gene_ann.gene_ids)?;
         write_barcodes(&raw_dir.join(&barcodes_name), &ctx.whitelist, sorted.len())?;
-        let n_entries = stream_matrix(
+        let mstats = stream_matrix(
             ctx,
             recorder,
             method,
@@ -459,9 +544,163 @@ pub fn write_gene_matrix(
             raw_dir.display(),
             ctx.gene_ann.gene_ids.len(),
             sorted.len(),
-            n_entries,
+            mstats.nnz,
+        );
+
+        let feature_mapped = reads_of(*feature).unwrap_or(0);
+        write_summary(
+            &feature_dir.join("Summary.csv"),
+            feature.dir_name(),
+            &mstats,
+            total_reads,
+            valid_barcodes,
+            mapped_unique,
+            mapped_multi,
+            feature_mapped,
+            exonic,
+            genic,
+        )?;
+        log::info!("STARsolo: wrote {}/Summary.csv", feature.dir_name());
+    }
+    Ok(())
+}
+
+/// Write a CellRanger/STARsolo-style `Summary.csv` for one feature: the
+/// sequencing/mapping funnel (genome → exonic → intronic → intergenic) plus
+/// per-cell UMI/gene statistics over the CR2.2-knee-called cells.
+#[allow(clippy::too_many_arguments)]
+fn write_summary(
+    path: &Path,
+    feature_name: &str,
+    mstats: &MatrixStats,
+    total_reads: u64,
+    valid_barcodes: u64,
+    mapped_unique: u64,
+    mapped_multi: u64,
+    feature_mapped: u64,
+    exonic: Option<u64>,
+    genic: Option<u64>,
+) -> Result<(), Error> {
+    let frac = |num: u64| -> f64 {
+        if total_reads == 0 {
+            0.0
+        } else {
+            num as f64 / total_reads as f64
+        }
+    };
+
+    // Cell calling: CR2.2 knee on per-barcode UMI totals.
+    let mut umis_desc: Vec<u64> = mstats.cells.iter().map(|c| c.n_umis).collect();
+    umis_desc.sort_unstable_by(|a, b| b.cmp(a));
+    let thr = knee_cr22(&umis_desc, 3000, 0.99, 10.0);
+    let cells: Vec<&CellStat> = mstats.cells.iter().filter(|c| c.n_umis >= thr).collect();
+    let n_cells = cells.len();
+
+    // Totals across all barcodes (for sequencing saturation + fraction-in-cells).
+    let total_reads_counted: u64 = mstats.cells.iter().map(|c| c.n_reads).sum();
+    let total_umis_all: u64 = mstats.cells.iter().map(|c| c.n_umis).sum();
+    let saturation = if total_reads_counted > 0 {
+        1.0 - total_umis_all as f64 / total_reads_counted as f64
+    } else {
+        0.0
+    };
+
+    // Per-cell aggregates over called cells.
+    let reads_in_cells: u64 = cells.iter().map(|c| c.n_reads).sum();
+    let umis_in_cells: u64 = cells.iter().map(|c| c.n_umis).sum();
+    let mut reads_sorted: Vec<u64> = cells.iter().map(|c| c.n_reads).collect();
+    let mut umis_sorted: Vec<u64> = cells.iter().map(|c| c.n_umis).collect();
+    let mut genes_sorted: Vec<u64> = cells.iter().map(|c| c.n_genes as u64).collect();
+    reads_sorted.sort_unstable();
+    umis_sorted.sort_unstable();
+    genes_sorted.sort_unstable();
+    let mean = |sum: u64| -> u64 {
+        if n_cells == 0 {
+            0
+        } else {
+            sum / n_cells as u64
+        }
+    };
+
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut row = |k: &str, v: String| {
+        let _ = writeln!(out, "{k},{v}");
+    };
+    row("Number of Reads", total_reads.to_string());
+    row(
+        "Reads With Valid Barcodes",
+        format!("{:.6}", frac(valid_barcodes)),
+    );
+    row("Sequencing Saturation", format!("{saturation:.6}"));
+    row(
+        "Reads Mapped to Genome: Unique+Multiple",
+        format!("{:.6}", frac(mapped_unique + mapped_multi)),
+    );
+    row(
+        "Reads Mapped to Genome: Unique",
+        format!("{:.6}", frac(mapped_unique)),
+    );
+    row(
+        &format!("Reads Mapped to {feature_name}: Unique {feature_name}"),
+        format!("{:.6}", frac(feature_mapped)),
+    );
+    // Genome → exonic → intronic → intergenic funnel (needs Gene + GeneFull).
+    if let (Some(ex), Some(genic_n)) = (exonic, genic) {
+        row(
+            "Reads Mapped Confidently to Exonic Regions",
+            format!("{:.6}", frac(ex)),
+        );
+        row(
+            "Reads Mapped Confidently to Intronic Regions",
+            format!("{:.6}", frac(genic_n.saturating_sub(ex))),
+        );
+        row(
+            "Reads Mapped Confidently to Intergenic Regions",
+            format!("{:.6}", frac(mapped_unique.saturating_sub(genic_n))),
         );
     }
+    row("Estimated Number of Cells", n_cells.to_string());
+    row(
+        &format!("Unique Reads in Cells Mapped to {feature_name}"),
+        reads_in_cells.to_string(),
+    );
+    row(
+        "Fraction of Unique Reads in Cells",
+        format!(
+            "{:.6}",
+            if total_reads_counted > 0 {
+                reads_in_cells as f64 / total_reads_counted as f64
+            } else {
+                0.0
+            }
+        ),
+    );
+    row("Mean Reads per Cell", mean(reads_in_cells).to_string());
+    row(
+        "Median Reads per Cell",
+        median_sorted(&reads_sorted).to_string(),
+    );
+    row("UMIs in Cells", umis_in_cells.to_string());
+    row("Mean UMI per Cell", mean(umis_in_cells).to_string());
+    row(
+        "Median UMI per Cell",
+        median_sorted(&umis_sorted).to_string(),
+    );
+    row(
+        &format!("Mean {feature_name} per Cell"),
+        mean(genes_sorted.iter().sum()).to_string(),
+    );
+    row(
+        &format!("Median {feature_name} per Cell"),
+        median_sorted(&genes_sorted).to_string(),
+    );
+    row(
+        &format!("Total {feature_name} Detected"),
+        mstats.genes_detected.to_string(),
+    );
+
+    std::fs::write(path, out).map_err(|e| Error::io(e, path))?;
     Ok(())
 }
 
@@ -503,6 +742,27 @@ mod tests {
     use super::*;
     use crate::io::fastq::encode_base;
     use crate::solo::whitelist::pack_barcode;
+
+    #[test]
+    fn median_sorted_odd_even_empty() {
+        assert_eq!(median_sorted(&[]), 0);
+        assert_eq!(median_sorted(&[5]), 5);
+        assert_eq!(median_sorted(&[1, 2, 3]), 2);
+        assert_eq!(median_sorted(&[10, 20, 30, 40]), 25); // midpoint(20,30)
+    }
+
+    #[test]
+    fn knee_cr22_threshold() {
+        // 100 cells at 1000 UMI, then a long ambient tail at 10.
+        let mut umis: Vec<u64> = vec![1000; 100];
+        umis.extend(std::iter::repeat_n(10u64, 5000));
+        umis.sort_unstable_by(|a, b| b.cmp(a));
+        // robust max = umis[round(3000*0.01)] = umis[30] = 1000; thr = 1000/10 = 100.
+        let thr = knee_cr22(&umis, 3000, 0.99, 10.0);
+        assert_eq!(thr, 100);
+        let cells = umis.iter().filter(|&&u| u >= thr).count();
+        assert_eq!(cells, 100); // the 100 real cells, none of the ambient tail
+    }
 
     fn umi(s: &str) -> u64 {
         match pack_barcode(&s.bytes().map(encode_base).collect::<Vec<_>>()) {

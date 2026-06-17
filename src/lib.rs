@@ -376,8 +376,8 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
                 recorder.n_multi_records(),
             );
         }
-        // Write the raw count matrix per feature ({feature}/raw/{matrix.mtx,...}).
-        crate::solo::write_gene_matrix(sctx, &params)?;
+        // Write the raw count matrix + Summary.csv per feature.
+        crate::solo::write_gene_matrix(sctx, &params, &stats)?;
     }
 
     info!("Alignment complete!");

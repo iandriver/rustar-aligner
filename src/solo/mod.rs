@@ -26,6 +26,7 @@ use crate::params::{Parameters, SoloType};
 use crate::quant::GeneAnnotation;
 use std::path::Path;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Fixed-position cell-barcode + UMI geometry for `CB_UMI_Simple`.
 ///
@@ -349,6 +350,10 @@ pub struct SoloContext {
     /// and `Solo.out/<feature>/raw/` output. Parallel to `recorders`.
     pub features: Vec<SoloFeature>,
     pub recorders: Vec<SoloRecorder>,
+    /// Reads uniquely assigned to a gene per feature (parallel to `features`).
+    /// `feature_reads[Gene]` counts exonic reads; `[GeneFull]` counts genic
+    /// (exon+intron) reads — their difference is the intronic fraction.
+    pub feature_reads: Vec<AtomicU64>,
 }
 
 /// What happened to one solo read — one `(record, multi)` per quantified
@@ -426,6 +431,7 @@ impl SoloContext {
             features
         };
         let recorders = features.iter().map(|_| SoloRecorder::new()).collect();
+        let feature_reads = features.iter().map(|_| AtomicU64::new(0)).collect();
 
         Ok(Self {
             layout: SoloBarcodeLayout::from_params(params),
@@ -436,6 +442,7 @@ impl SoloContext {
             stats: CbMatchStats::new(),
             features,
             recorders,
+            feature_reads,
         })
     }
 
@@ -484,7 +491,8 @@ impl SoloContext {
         out.per_feature = self
             .features
             .iter()
-            .map(|&feature| {
+            .enumerate()
+            .map(|(fi, &feature)| {
                 let mut fo = FeatureOutcome::default();
                 let gene =
                     match assign_gene_se(cdna_transcripts, &self.gene_ann, self.strand, feature) {
@@ -493,6 +501,9 @@ impl SoloContext {
                         | GeneAssignment::Ambiguous
                         | GeneAssignment::Unmapped => return fo,
                     };
+                // Read uniquely assigned to a gene under this feature (used for
+                // the Summary.csv genome→exon→intron→intergenic funnel).
+                self.feature_reads[fi].fetch_add(1, Ordering::Relaxed);
                 match (cb_resolved, &cb_match) {
                     (Some(cb), _) => fo.record = Some(SoloCountRecord { cb, umi, gene }),
                     (None, CbMatch::Multi(cands)) => {
