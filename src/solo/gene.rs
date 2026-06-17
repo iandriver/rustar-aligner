@@ -95,53 +95,155 @@ fn strand_keeps(strand: SoloStrand, gene_is_reverse: bool, read_is_reverse: bool
     }
 }
 
+/// CellRanger-style positional region of a uniquely-mapped read (independent of
+/// strand): which genomic region the read falls in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Region {
+    /// Overlaps ≥1 annotated exon.
+    Exonic,
+    /// Overlaps a gene body but no exon (purely intronic).
+    Intronic,
+    /// Overlaps no gene body.
+    Intergenic,
+}
+
+/// Everything one read's alignment set tells us, computed in a single pass over
+/// the gene model (the two overlap queries are shared between the per-feature
+/// gene assignment and the region classification, so this costs no more than the
+/// old two `assign_gene_se` calls).
+#[derive(Debug, Clone, Copy)]
+pub struct ReadClass {
+    /// Sense-strand exonic gene assignment (the `Gene` feature). `Unmapped` if
+    /// exon overlap was not requested.
+    pub gene: GeneAssignment,
+    /// Sense-strand gene-body assignment (the `GeneFull` feature). `Unmapped` if
+    /// body overlap was not requested.
+    pub gene_full: GeneAssignment,
+    /// Positional region (only when both exon + body overlap were computed).
+    pub region: Option<Region>,
+    /// Read maps to a gene body on the antisense strand and to none on the sense
+    /// strand (CellRanger's "Reads Mapped Antisense to Gene").
+    pub antisense: bool,
+}
+
+fn assignment_of(sense_genes: &[usize]) -> GeneAssignment {
+    match sense_genes.len() {
+        0 => GeneAssignment::NoFeature,
+        1 => GeneAssignment::Gene(sense_genes[0] as u32),
+        _ => GeneAssignment::Ambiguous,
+    }
+}
+
+/// Classify a read in one pass: sense-strand `Gene`/`GeneFull` assignments plus
+/// the CellRanger-style positional region + antisense flag. `want_exon` /
+/// `want_body` skip the corresponding overlap query when a feature is not needed.
+pub fn classify_read(
+    transcripts: &[Transcript],
+    gene_ann: &GeneAnnotation,
+    strand: SoloStrand,
+    want_exon: bool,
+    want_body: bool,
+) -> ReadClass {
+    if transcripts.is_empty() {
+        return ReadClass {
+            gene: GeneAssignment::Unmapped,
+            gene_full: GeneAssignment::Unmapped,
+            region: None,
+            antisense: false,
+        };
+    }
+
+    thread_local! {
+        static RAW: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        static EXON_S: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+        static BODY_S: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    }
+
+    RAW.with(|rb| {
+        EXON_S.with(|eb| {
+            BODY_S.with(|bb| {
+                let mut raw = rb.borrow_mut();
+                let mut exon_s = eb.borrow_mut();
+                let mut body_s = bb.borrow_mut();
+                exon_s.clear();
+                body_s.clear();
+                // `*_any` track positional (either-strand) overlap for the region;
+                // `body_anti_any` tracks an antisense-only body hit.
+                let (mut exon_any, mut body_any, mut body_anti_any) = (false, false, false);
+
+                for tr in transcripts {
+                    if want_exon {
+                        gene_ann.overlapping_genes_into(tr, &mut raw);
+                        for &g in raw.iter() {
+                            exon_any = true;
+                            if strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse) {
+                                exon_s.push(g);
+                            }
+                        }
+                    }
+                    if want_body {
+                        gene_ann.overlapping_genes_full_into(tr, &mut raw);
+                        for &g in raw.iter() {
+                            body_any = true;
+                            if strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse) {
+                                body_s.push(g);
+                            } else {
+                                body_anti_any = true;
+                            }
+                        }
+                    }
+                }
+                exon_s.sort_unstable();
+                exon_s.dedup();
+                body_s.sort_unstable();
+                body_s.dedup();
+
+                let region = if want_exon && want_body {
+                    Some(if exon_any {
+                        Region::Exonic
+                    } else if body_any {
+                        Region::Intronic
+                    } else {
+                        Region::Intergenic
+                    })
+                } else {
+                    None
+                };
+
+                ReadClass {
+                    gene: if want_exon {
+                        assignment_of(&exon_s)
+                    } else {
+                        GeneAssignment::Unmapped
+                    },
+                    gene_full: if want_body {
+                        assignment_of(&body_s)
+                    } else {
+                        GeneAssignment::Unmapped
+                    },
+                    region,
+                    antisense: body_anti_any && body_s.is_empty(),
+                }
+            })
+        })
+    })
+}
+
 /// Assign a single-end (cDNA) read to a gene from its alignment set, using the
 /// `Gene` (exonic) or `GeneFull` (gene-body, intron-inclusive) overlap basis.
+/// Thin wrapper over [`classify_read`] for the single-feature case (and tests).
 pub fn assign_gene_se(
     transcripts: &[Transcript],
     gene_ann: &GeneAnnotation,
     strand: SoloStrand,
     feature: SoloFeature,
 ) -> GeneAssignment {
-    if transcripts.is_empty() {
-        return GeneAssignment::Unmapped;
+    let want_exon = feature == SoloFeature::Gene;
+    let class = classify_read(transcripts, gene_ann, strand, want_exon, !want_exon);
+    match feature {
+        SoloFeature::Gene => class.gene,
+        SoloFeature::GeneFull => class.gene_full,
     }
-
-    // Reuse per-thread scratch buffers: this runs once per feature per read
-    // (twice/read for `Gene GeneFull`), so a fresh Vec each call is pure churn.
-    thread_local! {
-        static OVERLAP_BUF: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-        static GENES_BUF: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    }
-
-    OVERLAP_BUF.with(|ob| {
-        GENES_BUF.with(|gb| {
-            let mut overlap = ob.borrow_mut();
-            let mut genes = gb.borrow_mut();
-            genes.clear();
-            for tr in transcripts {
-                match feature {
-                    SoloFeature::Gene => gene_ann.overlapping_genes_into(tr, &mut overlap),
-                    SoloFeature::GeneFull => {
-                        gene_ann.overlapping_genes_full_into(tr, &mut overlap);
-                    }
-                }
-                for &g in overlap.iter() {
-                    if strand_keeps(strand, gene_ann.gene_is_reverse[g], tr.is_reverse) {
-                        genes.push(g);
-                    }
-                }
-            }
-            genes.sort_unstable();
-            genes.dedup();
-
-            match genes.len() {
-                0 => GeneAssignment::NoFeature,
-                1 => GeneAssignment::Gene(genes[0] as u32),
-                _ => GeneAssignment::Ambiguous,
-            }
-        })
-    })
 }
 
 #[cfg(test)]
@@ -311,5 +413,54 @@ mod tests {
             GeneAssignment::Gene(gi) => assert_eq!(ann.gene_ids[gi as usize], "G3"),
             other => panic!("expected G3 under GeneFull, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn classify_read_regions_and_antisense() {
+        // Ga (+): exons [100,200) and [400,500) → body [100,500), intron [200,400).
+        let g = genome();
+        let exons = vec![gtf_exon(101, 200, '+', "Ga"), gtf_exon(401, 500, '+', "Ga")];
+        let ann = GeneAnnotation::from_gtf_exons(&exons, &g);
+        let cls = |start, end, rev| {
+            classify_read(
+                &[read_at(start, end, rev)],
+                &ann,
+                SoloStrand::Forward,
+                true,
+                true,
+            )
+        };
+
+        // In an exon, sense strand → Exonic, not antisense.
+        let c = cls(120, 180, false);
+        assert_eq!(c.region, Some(Region::Exonic));
+        assert!(!c.antisense);
+        assert!(matches!(c.gene, GeneAssignment::Gene(_)));
+
+        // Entirely within the intron → Intronic (body but no exon).
+        assert_eq!(cls(250, 350, false).region, Some(Region::Intronic));
+
+        // Outside the gene → Intergenic.
+        assert_eq!(cls(700, 800, false).region, Some(Region::Intergenic));
+
+        // Exonic position but read on the opposite strand of a (+) gene:
+        // positionally Exonic, flagged antisense, no sense gene assignment.
+        let c = cls(120, 180, true);
+        assert_eq!(c.region, Some(Region::Exonic));
+        assert!(c.antisense);
+        assert_eq!(c.gene, GeneAssignment::NoFeature);
+
+        // No region computed when only one side requested.
+        assert_eq!(
+            classify_read(
+                &[read_at(120, 180, false)],
+                &ann,
+                SoloStrand::Forward,
+                true,
+                false
+            )
+            .region,
+            None
+        );
     }
 }

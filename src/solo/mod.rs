@@ -14,7 +14,7 @@ pub mod gene;
 pub mod whitelist;
 
 pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};
-pub use gene::{GeneAssignment, SoloFeature, SoloStrand, assign_gene_se};
+pub use gene::{GeneAssignment, Region, SoloFeature, SoloStrand, assign_gene_se, classify_read};
 pub use whitelist::{
     CbCandidate, CbMatch, CbMatchStats, CbMatchType, CbWhitelist, UmiCheck, check_umi, pack_barcode,
 };
@@ -350,10 +350,24 @@ pub struct SoloContext {
     /// and `Solo.out/<feature>/raw/` output. Parallel to `recorders`.
     pub features: Vec<SoloFeature>,
     pub recorders: Vec<SoloRecorder>,
-    /// Reads uniquely assigned to a gene per feature (parallel to `features`).
-    /// `feature_reads[Gene]` counts exonic reads; `[GeneFull]` counts genic
-    /// (exon+intron) reads — their difference is the intronic fraction.
+    /// Reads uniquely assigned to a gene per feature (parallel to `features`),
+    /// among valid-barcode reads — the STARsolo "Reads Mapped to <feature>:
+    /// Unique" metric.
     pub feature_reads: Vec<AtomicU64>,
+    /// CellRanger-style positional mapping funnel over uniquely-mapped reads
+    /// (independent of barcode), populated only when both `Gene` and `GeneFull`
+    /// features run.
+    pub region_stats: RegionStats,
+}
+
+/// Per-region read tallies for the `Summary.csv` mapping funnel (uniquely-mapped
+/// reads, mirroring CellRanger's "confidently mapped to ... regions").
+#[derive(Default)]
+pub struct RegionStats {
+    pub exonic: AtomicU64,
+    pub intronic: AtomicU64,
+    pub intergenic: AtomicU64,
+    pub antisense: AtomicU64,
 }
 
 /// What happened to one solo read — one `(record, multi)` per quantified
@@ -443,6 +457,7 @@ impl SoloContext {
             features,
             recorders,
             feature_reads,
+            region_stats: RegionStats::default(),
         })
     }
 
@@ -456,7 +471,41 @@ impl SoloContext {
     ) -> SoloReadOutcome {
         let mut out = SoloReadOutcome::default();
 
-        // No barcode read (too short) → nothing to count.
+        // One-pass classification: the two overlap queries are shared between the
+        // per-feature gene assignment and the CellRanger-style mapping funnel, so
+        // this is no more work than the old per-feature `assign_gene_se` calls.
+        let want_exon = self.features.contains(&SoloFeature::Gene);
+        let want_body = self.features.contains(&SoloFeature::GeneFull);
+        let class = classify_read(
+            cdna_transcripts,
+            &self.gene_ann,
+            self.strand,
+            want_exon,
+            want_body,
+        );
+
+        // Mapping funnel: count uniquely-mapped reads by region (CellRanger's
+        // "confidently mapped" = MAPQ 255 ≈ a single alignment), independent of
+        // barcode validity.
+        if cdna_transcripts.len() == 1 {
+            match class.region {
+                Some(Region::Exonic) => {
+                    self.region_stats.exonic.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(Region::Intronic) => {
+                    self.region_stats.intronic.fetch_add(1, Ordering::Relaxed);
+                }
+                Some(Region::Intergenic) => {
+                    self.region_stats.intergenic.fetch_add(1, Ordering::Relaxed);
+                }
+                None => {}
+            }
+            if class.antisense {
+                self.region_stats.antisense.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        // No barcode read (too short) → nothing to count (region already tallied).
         let Some(bc) = barcode else {
             return out;
         };
@@ -485,24 +534,26 @@ impl SoloContext {
             }
         };
 
-        // The CB match + UMI are shared across features; only gene assignment
-        // differs (exonic Gene vs gene-body GeneFull). Produce one outcome per
-        // feature.
+        // The CB match + UMI are shared across features; reuse the cached
+        // per-feature gene assignment from `classify_read`. One outcome/feature.
         out.per_feature = self
             .features
             .iter()
             .enumerate()
             .map(|(fi, &feature)| {
                 let mut fo = FeatureOutcome::default();
-                let gene =
-                    match assign_gene_se(cdna_transcripts, &self.gene_ann, self.strand, feature) {
-                        GeneAssignment::Gene(g) => g,
-                        GeneAssignment::NoFeature
-                        | GeneAssignment::Ambiguous
-                        | GeneAssignment::Unmapped => return fo,
-                    };
-                // Read uniquely assigned to a gene under this feature (used for
-                // the Summary.csv genome→exon→intron→intergenic funnel).
+                let assignment = match feature {
+                    SoloFeature::Gene => class.gene,
+                    SoloFeature::GeneFull => class.gene_full,
+                };
+                let gene = match assignment {
+                    GeneAssignment::Gene(g) => g,
+                    GeneAssignment::NoFeature
+                    | GeneAssignment::Ambiguous
+                    | GeneAssignment::Unmapped => return fo,
+                };
+                // Reads uniquely mapped to a gene under this feature, among
+                // valid-barcode reads (STARsolo "Reads Mapped to <feature>").
                 self.feature_reads[fi].fetch_add(1, Ordering::Relaxed);
                 match (cb_resolved, &cb_match) {
                     (Some(cb), _) => fo.record = Some(SoloCountRecord { cb, umi, gene }),

@@ -83,6 +83,7 @@ def main():
         ("  ... exonic", "Reads Mapped Confidently to Exonic Regions", None, "Reads Mapped Confidently to Exonic Regions", pct),
         ("  ... intronic", "Reads Mapped Confidently to Intronic Regions", None, "Reads Mapped Confidently to Intronic Regions", pct),
         ("  ... intergenic", "Reads Mapped Confidently to Intergenic Regions", None, "Reads Mapped Confidently to Intergenic Regions", pct),
+        ("Reads antisense to gene", "Reads Mapped Antisense to Gene", None, "Reads Mapped Antisense to Gene", pct),
         ("Estimated number of cells", "Estimated Number of Cells", "Estimated Number of Cells", "Estimated Number of Cells", intg),
         ("Mean reads / cell", "Mean Reads per Cell", "Mean Reads per Cell", "Mean Reads per Cell", intg),
         (f"Median genes / cell", f"Median {f} per Cell", f"Median {f} per Cell", "Median Genes per Cell", intg),

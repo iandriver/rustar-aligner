@@ -498,9 +498,9 @@ pub fn write_gene_matrix(
         .cloned()
         .unwrap_or_else(|| "matrix.mtx".to_string());
 
-    // Global mapping funnel (shared across features). `feature_reads` counts
-    // reads uniquely assigned to a gene under each feature, so exonic = Gene,
-    // genic = GeneFull, intronic = genic − exonic, intergenic = mapped − genic.
+    // Global mapping funnel (shared across features). The region tallies are
+    // CellRanger-style positional bins over uniquely-mapped reads, populated only
+    // when both Gene and GeneFull run (otherwise the split is unavailable).
     use std::sync::atomic::Ordering;
     let total_reads = align_stats.total_reads.load(Ordering::Relaxed);
     let mapped_unique = align_stats.uniquely_mapped.load(Ordering::Relaxed);
@@ -508,14 +508,20 @@ pub fn write_gene_matrix(
     let valid_barcodes = ctx.stats.yes_exact.load(Ordering::Relaxed)
         + ctx.stats.yes_one_mm.load(Ordering::Relaxed)
         + ctx.stats.yes_mult_mm.load(Ordering::Relaxed);
-    let reads_of = |f: crate::solo::SoloFeature| -> Option<u64> {
+    let reads_of = |f: crate::solo::SoloFeature| -> u64 {
         ctx.features
             .iter()
             .position(|&x| x == f)
-            .map(|i| ctx.feature_reads[i].load(Ordering::Relaxed))
+            .map_or(0, |i| ctx.feature_reads[i].load(Ordering::Relaxed))
     };
-    let exonic = reads_of(crate::solo::SoloFeature::Gene);
-    let genic = reads_of(crate::solo::SoloFeature::GeneFull);
+    let have_funnel = ctx.features.contains(&crate::solo::SoloFeature::Gene)
+        && ctx.features.contains(&crate::solo::SoloFeature::GeneFull);
+    let region = have_funnel.then(|| RegionFunnel {
+        exonic: ctx.region_stats.exonic.load(Ordering::Relaxed),
+        intronic: ctx.region_stats.intronic.load(Ordering::Relaxed),
+        intergenic: ctx.region_stats.intergenic.load(Ordering::Relaxed),
+        antisense: ctx.region_stats.antisense.load(Ordering::Relaxed),
+    });
 
     // One {prefix}{soloOutFileNames[0]}<feature>/raw/ directory per feature
     // (Gene, GeneFull, …), each fed from its own recorder.
@@ -547,7 +553,6 @@ pub fn write_gene_matrix(
             mstats.nnz,
         );
 
-        let feature_mapped = reads_of(*feature).unwrap_or(0);
         write_summary(
             &feature_dir.join("Summary.csv"),
             feature.dir_name(),
@@ -556,18 +561,26 @@ pub fn write_gene_matrix(
             valid_barcodes,
             mapped_unique,
             mapped_multi,
-            feature_mapped,
-            exonic,
-            genic,
+            reads_of(*feature),
+            region,
         )?;
         log::info!("STARsolo: wrote {}/Summary.csv", feature.dir_name());
     }
     Ok(())
 }
 
+/// CellRanger-style positional mapping bins over uniquely-mapped reads.
+#[derive(Clone, Copy)]
+struct RegionFunnel {
+    exonic: u64,
+    intronic: u64,
+    intergenic: u64,
+    antisense: u64,
+}
+
 /// Write a CellRanger/STARsolo-style `Summary.csv` for one feature: the
-/// sequencing/mapping funnel (genome → exonic → intronic → intergenic) plus
-/// per-cell UMI/gene statistics over the CR2.2-knee-called cells.
+/// sequencing/mapping funnel (genome → exonic → intronic → intergenic, antisense)
+/// plus per-cell UMI/gene statistics over the CR2.2-knee-called cells.
 #[allow(clippy::too_many_arguments)]
 fn write_summary(
     path: &Path,
@@ -578,8 +591,7 @@ fn write_summary(
     mapped_unique: u64,
     mapped_multi: u64,
     feature_mapped: u64,
-    exonic: Option<u64>,
-    genic: Option<u64>,
+    region: Option<RegionFunnel>,
 ) -> Result<(), Error> {
     let frac = |num: u64| -> f64 {
         if total_reads == 0 {
@@ -645,19 +657,25 @@ fn write_summary(
         &format!("Reads Mapped to {feature_name}: Unique {feature_name}"),
         format!("{:.6}", frac(feature_mapped)),
     );
-    // Genome → exonic → intronic → intergenic funnel (needs Gene + GeneFull).
-    if let (Some(ex), Some(genic_n)) = (exonic, genic) {
+    // CellRanger-style positional funnel over uniquely-mapped reads (each region
+    // counted by where the read falls, independent of strand; antisense is a
+    // separate orientation metric). Available only with Gene + GeneFull.
+    if let Some(r) = region {
         row(
             "Reads Mapped Confidently to Exonic Regions",
-            format!("{:.6}", frac(ex)),
+            format!("{:.6}", frac(r.exonic)),
         );
         row(
             "Reads Mapped Confidently to Intronic Regions",
-            format!("{:.6}", frac(genic_n.saturating_sub(ex))),
+            format!("{:.6}", frac(r.intronic)),
         );
         row(
             "Reads Mapped Confidently to Intergenic Regions",
-            format!("{:.6}", frac(mapped_unique.saturating_sub(genic_n))),
+            format!("{:.6}", frac(r.intergenic)),
+        );
+        row(
+            "Reads Mapped Antisense to Gene",
+            format!("{:.6}", frac(r.antisense)),
         );
     }
     row("Estimated Number of Cells", n_cells.to_string());
