@@ -12,10 +12,39 @@
 use crate::error::Error;
 use crate::solo::whitelist::CbWhitelist;
 use crate::solo::{SoloContext, SoloCountRecord};
+use flate2::Compression;
+use flate2::write::GzEncoder;
 use std::collections::HashMap;
-use std::io::Write as _;
-use std::path::Path;
+use std::io::{BufRead, BufReader, Write as _};
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
+
+/// Open a solo output file, gzipping it (and appending `.gz` to the name) when
+/// `gzip` is set. The body is written by the closure; the gzip stream is
+/// finished explicitly so the trailer is always flushed. Returns the path written.
+fn write_file<F>(path: &Path, gzip: bool, body: F) -> Result<PathBuf, Error>
+where
+    F: FnOnce(&mut dyn std::io::Write) -> Result<(), Error>,
+{
+    let final_path = if gzip {
+        let mut s = path.as_os_str().to_owned();
+        s.push(".gz");
+        PathBuf::from(s)
+    } else {
+        path.to_path_buf()
+    };
+    let file = std::fs::File::create(&final_path).map_err(|e| Error::io(e, &final_path))?;
+    if gzip {
+        let mut enc = GzEncoder::new(file, Compression::default());
+        body(&mut enc)?;
+        enc.finish().map_err(|e| Error::io(e, &final_path))?;
+    } else {
+        let mut w = std::io::BufWriter::new(file);
+        body(&mut w)?;
+        w.flush().map_err(|e| Error::io(e, &final_path))?;
+    }
+    Ok(final_path)
+}
 
 // ---------------------------------------------------------------------------
 // UMI deduplication
@@ -261,16 +290,18 @@ fn resolve_multi_cb(
 /// Records are sorted by cb (ascending column), and each cell's genes are
 /// emitted ascending, so entries come out in the same order as before.
 #[allow(clippy::too_many_arguments)]
-/// Per-cell summary collected while streaming the matrix: reads (records before
-/// UMI dedup), UMIs (deduped column sum), and genes detected (nonzero entries).
+/// Per-cell summary collected while streaming the matrix: the whitelist barcode
+/// index, reads (records before UMI dedup), UMIs (deduped column sum), and genes
+/// detected (nonzero entries).
 #[derive(Clone, Copy)]
 pub struct CellStat {
+    pub cb: u32,
     pub n_reads: u64,
     pub n_umis: u64,
     pub n_genes: u32,
 }
 
-/// What `stream_matrix` returns alongside the written matrix.
+/// What `build_matrix_body` returns alongside the temp matrix body.
 pub struct MatrixStats {
     pub nnz: usize,
     /// One entry per barcode that received ≥1 UMI (the raw, unfiltered set).
@@ -279,19 +310,21 @@ pub struct MatrixStats {
     pub genes_detected: u32,
 }
 
+/// Stream the per-cell deduplicated counts into a plain temporary MatrixMarket
+/// *body* (`gene+1 cb+1 count`, barcode-ascending) and collect per-cell stats.
+/// The body is finalized into `raw/` (and optionally `filtered/`) by the caller,
+/// which lets the raw + filtered matrices share one streaming pass.
 #[allow(clippy::too_many_arguments)]
-fn stream_matrix(
+fn build_matrix_body(
     ctx: &SoloContext,
     recorder: &crate::solo::SoloRecorder,
     method: UmiDedup,
     filtering: UmiFiltering,
     umi_len: usize,
     pseudocount: f64,
-    matrix_path: &Path,
+    dir: &Path,
     n_features: usize,
-    n_barcodes: usize,
-) -> Result<MatrixStats, Error> {
-    let dir = matrix_path.parent().unwrap_or_else(|| Path::new("."));
+) -> Result<(tempfile::NamedTempFile, MatrixStats), Error> {
     let mut body_tmp = tempfile::Builder::new()
         .prefix(".matrix_body")
         .tempfile_in(dir)
@@ -363,12 +396,12 @@ fn stream_matrix(
             for (g, c) in cell_entries {
                 n_umis += c;
                 gene_seen[g as usize] = true;
-                writeln!(body, "{} {} {}", g + 1, cb + 1, c)
-                    .map_err(|e| Error::io(e, matrix_path))?;
+                writeln!(body, "{} {} {}", g + 1, cb + 1, c).map_err(|e| Error::io(e, dir))?;
                 nnz += 1;
             }
             if n_umis > 0 {
                 cell_stats.push(CellStat {
+                    cb,
                     n_reads,
                     n_umis,
                     n_genes,
@@ -377,26 +410,86 @@ fn stream_matrix(
 
             i = j;
         }
-        body.flush().map_err(|e| Error::io(e, matrix_path))?;
+        body.flush().map_err(|e| Error::io(e, dir))?;
     }
 
-    // Final matrix.mtx = MatrixMarket header (now that nnz is known) + temp body.
-    let mut out = std::io::BufWriter::new(
-        std::fs::File::create(matrix_path).map_err(|e| Error::io(e, matrix_path))?,
-    );
-    writeln!(out, "%%MatrixMarket matrix coordinate integer general")
-        .map_err(|e| Error::io(e, matrix_path))?;
-    writeln!(out, "%").map_err(|e| Error::io(e, matrix_path))?;
-    writeln!(out, "{n_features} {n_barcodes} {nnz}").map_err(|e| Error::io(e, matrix_path))?;
-    let mut body_read = body_tmp.reopen().map_err(|e| Error::io(e, matrix_path))?;
-    std::io::copy(&mut body_read, &mut out).map_err(|e| Error::io(e, matrix_path))?;
-    out.flush().map_err(|e| Error::io(e, matrix_path))?;
     let genes_detected = gene_seen.iter().filter(|&&s| s).count() as u32;
-    Ok(MatrixStats {
-        nnz,
-        cells: cell_stats,
-        genes_detected,
-    })
+    Ok((
+        body_tmp,
+        MatrixStats {
+            nnz,
+            cells: cell_stats,
+            genes_detected,
+        },
+    ))
+}
+
+/// Write a final `matrix.mtx[.gz]` = MatrixMarket header + (optionally
+/// cb-remapped/filtered) body. With `remap = None` the body is copied verbatim
+/// (raw); with `Some(map)` only columns in the map survive, renumbered to the
+/// `n_cols` called cells. Returns the entry count written.
+fn finalize_matrix(
+    body: &tempfile::NamedTempFile,
+    out_path: &Path,
+    gzip: bool,
+    n_features: usize,
+    n_cols: usize,
+    raw_nnz: usize,
+    remap: Option<&HashMap<u32, u32>>,
+) -> Result<usize, Error> {
+    // For the filtered matrix we must know nnz before the header, so first build
+    // the remapped body into a temp and count it; raw reuses the known nnz.
+    let (src, nnz): (PathBuf, usize) = match remap {
+        None => (body.path().to_path_buf(), raw_nnz),
+        Some(map) => {
+            let dir = out_path.parent().unwrap_or_else(|| Path::new("."));
+            let mut ftmp = tempfile::Builder::new()
+                .prefix(".matrix_filt")
+                .tempfile_in(dir)
+                .map_err(|e| Error::io(e, dir))?;
+            let mut kept = 0usize;
+            {
+                let mut w = std::io::BufWriter::new(ftmp.as_file_mut());
+                let reader = BufReader::new(
+                    std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?,
+                );
+                for line in reader.lines() {
+                    let line = line.map_err(|e| Error::io(e, body.path()))?;
+                    let mut it = line.split(' ');
+                    let (Some(gene), Some(cb1), Some(cnt)) = (it.next(), it.next(), it.next())
+                    else {
+                        continue;
+                    };
+                    let cb0: u32 = cb1.parse::<u32>().unwrap_or(0).saturating_sub(1);
+                    if let Some(&col) = map.get(&cb0) {
+                        writeln!(w, "{gene} {col} {cnt}").map_err(|e| Error::io(e, out_path))?;
+                        kept += 1;
+                    }
+                }
+                w.flush().map_err(|e| Error::io(e, out_path))?;
+            }
+            (
+                ftmp.into_temp_path()
+                    .keep()
+                    .map_err(|e| Error::io(e.error, out_path))?,
+                kept,
+            )
+        }
+    };
+
+    write_file(out_path, gzip, |w| {
+        writeln!(w, "%%MatrixMarket matrix coordinate integer general")
+            .map_err(|e| Error::io(e, out_path))?;
+        writeln!(w, "%").map_err(|e| Error::io(e, out_path))?;
+        writeln!(w, "{n_features} {n_cols} {nnz}").map_err(|e| Error::io(e, out_path))?;
+        let mut r = std::fs::File::open(&src).map_err(|e| Error::io(e, &src))?;
+        std::io::copy(&mut r, w).map_err(|e| Error::io(e, out_path))?;
+        Ok(())
+    })?;
+    if remap.is_some() {
+        let _ = std::fs::remove_file(&src); // best-effort cleanup of the filtered temp
+    }
+    Ok(nnz)
 }
 
 /// Apply `--soloUMIfiltering` to the gene→read_count map of a single UMI,
@@ -429,6 +522,44 @@ fn knee_cr22(umis_desc: &[u64], n_expected: usize, max_pct: f64, max_min_ratio: 
     let idx = ((n_expected as f64 * (1.0 - max_pct)).round() as usize).min(umis_desc.len() - 1);
     let robust_max = umis_desc[idx] as f64;
     (robust_max / max_min_ratio).ceil() as u64
+}
+
+/// Whitelist indices of called cells (sorted ascending) per `--soloCellFilter`.
+/// `None` → no filtered/ output. `EmptyDrops_CR` writes only the knee-guaranteed
+/// cells here (the Monte-Carlo rescue is the standalone `emptydrops` binary).
+fn called_cells(cells: &[CellStat], filter: &[String]) -> Option<Vec<u32>> {
+    let method = filter.first().map_or("CellRanger2.2", String::as_str);
+    let arg = |i: usize, d: f64| filter.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
+    let mut cbs: Vec<u32> = match method {
+        "None" => return None,
+        "TopCells" => {
+            let n = arg(1, 0.0) as usize;
+            let mut idx: Vec<&CellStat> = cells.iter().collect();
+            idx.sort_by(|a, b| b.n_umis.cmp(&a.n_umis).then(a.cb.cmp(&b.cb)));
+            idx.into_iter().take(n).map(|c| c.cb).collect()
+        }
+        "CellRanger2.2" | "EmptyDrops_CR" => {
+            if method == "EmptyDrops_CR" {
+                log::warn!(
+                    "--soloCellFilter EmptyDrops_CR: writing knee-called cells; run the `emptydrops` binary on raw/ for the Monte-Carlo rescue"
+                );
+            }
+            let mut umis: Vec<u64> = cells.iter().map(|c| c.n_umis).collect();
+            umis.sort_unstable_by(|a, b| b.cmp(a));
+            let thr = knee_cr22(&umis, arg(1, 3000.0) as usize, arg(2, 0.99), arg(3, 10.0));
+            cells
+                .iter()
+                .filter(|c| c.n_umis >= thr)
+                .map(|c| c.cb)
+                .collect()
+        }
+        other => {
+            log::warn!("--soloCellFilter '{other}' not supported; skipping filtered/ output");
+            return None;
+        }
+    };
+    cbs.sort_unstable();
+    Some(cbs)
 }
 
 /// Median of an ascending-sorted slice (0 if empty).
@@ -523,35 +654,81 @@ pub fn write_gene_matrix(
         antisense: ctx.region_stats.antisense.load(Ordering::Relaxed),
     });
 
-    // One {prefix}{soloOutFileNames[0]}<feature>/raw/ directory per feature
-    // (Gene, GeneFull, …), each fed from its own recorder.
+    let gzip = matches!(params.solo_out_gzip.as_str(), "yes" | "Yes" | "true");
+    let n_genes = ctx.gene_ann.gene_ids.len();
+
+    // One {prefix}{soloOutFileNames[0]}<feature>/{raw,filtered}/ per feature.
     for (feature, recorder) in ctx.features.iter().zip(&ctx.recorders) {
         let feature_dir = params.output_path(&format!("{solo_dir}{}/", feature.dir_name()));
         let raw_dir = feature_dir.join("raw");
         std::fs::create_dir_all(&raw_dir).map_err(|e| Error::io(e, &raw_dir))?;
 
-        write_features(&raw_dir.join(&features_name), &ctx.gene_ann.gene_ids)?;
-        write_barcodes(&raw_dir.join(&barcodes_name), &ctx.whitelist, sorted.len())?;
-        let mstats = stream_matrix(
+        // Stream the deduplicated counts into a shared temp body, then finalize
+        // the raw matrix (and the filtered one below) from it.
+        let (body, mstats) = build_matrix_body(
             ctx,
             recorder,
             method,
             filtering,
             umi_len,
             pseudocount,
-            &raw_dir.join(&matrix_name),
-            ctx.gene_ann.gene_ids.len(),
-            sorted.len(),
+            &raw_dir,
+            n_genes,
         )?;
-
-        log::info!(
-            "STARsolo: wrote {}/raw matrix to {} ({} genes × {} barcodes, {} entries)",
-            feature.dir_name(),
-            raw_dir.display(),
-            ctx.gene_ann.gene_ids.len(),
+        write_features(&raw_dir.join(&features_name), &ctx.gene_ann.gene_ids, gzip)?;
+        write_barcodes(
+            &raw_dir.join(&barcodes_name),
+            &ctx.whitelist,
+            sorted.len(),
+            gzip,
+        )?;
+        finalize_matrix(
+            &body,
+            &raw_dir.join(&matrix_name),
+            gzip,
+            n_genes,
             sorted.len(),
             mstats.nnz,
+            None,
+        )?;
+        log::info!(
+            "STARsolo: wrote {}/raw matrix ({} genes × {} barcodes, {} entries){}",
+            feature.dir_name(),
+            n_genes,
+            sorted.len(),
+            mstats.nnz,
+            if gzip { " [gzip]" } else { "" },
         );
+
+        // Filtered (cell-called) matrix per --soloCellFilter.
+        if let Some(cbs) = called_cells(&mstats.cells, &params.solo_cell_filter)
+            && !cbs.is_empty()
+        {
+            let filt_dir = feature_dir.join("filtered");
+            std::fs::create_dir_all(&filt_dir).map_err(|e| Error::io(e, &filt_dir))?;
+            let remap: HashMap<u32, u32> = cbs
+                .iter()
+                .enumerate()
+                .map(|(i, &cb)| (cb, i as u32 + 1))
+                .collect();
+            write_features(&filt_dir.join(&features_name), &ctx.gene_ann.gene_ids, gzip)?;
+            write_barcodes_subset(&filt_dir.join(&barcodes_name), &ctx.whitelist, &cbs, gzip)?;
+            let fnnz = finalize_matrix(
+                &body,
+                &filt_dir.join(&matrix_name),
+                gzip,
+                n_genes,
+                cbs.len(),
+                0,
+                Some(&remap),
+            )?;
+            log::info!(
+                "STARsolo: wrote {}/filtered matrix ({} cells, {} entries)",
+                feature.dir_name(),
+                cbs.len(),
+                fnnz,
+            );
+        }
 
         write_summary(
             &feature_dir.join("Summary.csv"),
@@ -724,35 +901,62 @@ fn write_summary(
 
 /// `features.tsv`: `gene_id <TAB> gene_name <TAB> "Gene Expression"` (CellRanger
 /// v3 layout). We have no gene names, so the id is repeated.
-fn write_features(path: &Path, gene_ids: &[String]) -> Result<(), Error> {
-    let mut f =
-        std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| Error::io(e, path))?);
-    for id in gene_ids {
-        writeln!(f, "{id}\t{id}\tGene Expression").map_err(|e| Error::io(e, path))?;
-    }
-    f.flush().map_err(|e| Error::io(e, path))
+fn write_features(path: &Path, gene_ids: &[String], gzip: bool) -> Result<(), Error> {
+    write_file(path, gzip, |w| {
+        for id in gene_ids {
+            writeln!(w, "{id}\t{id}\tGene Expression").map_err(|e| Error::io(e, path))?;
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
-/// `barcodes.tsv`: one barcode per line in sorted whitelist order (the same
-/// order the matrix columns are indexed by).
-///
-/// This lists the full whitelist (millions of lines), so it MUST be buffered —
-/// an unbuffered writer issues one syscall per line and dominates runtime,
-/// especially over a virtiofs mount. Barcodes are unpacked into a reused scratch
-/// buffer to avoid a `String` allocation per line.
-fn write_barcodes(path: &Path, whitelist: &CbWhitelist, n: usize) -> Result<(), Error> {
-    use std::io::Write as _;
-    let mut f =
-        std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| Error::io(e, path))?);
+/// Unpack `cb` into `line` (with trailing newline) and write it.
+fn write_one_barcode(
+    w: &mut dyn std::io::Write,
+    whitelist: &CbWhitelist,
+    cb: u32,
+    line: &mut Vec<u8>,
+    path: &Path,
+) -> Result<(), Error> {
+    line.clear();
+    whitelist.unpack_barcode_into(cb, line);
+    line.push(b'\n');
+    w.write_all(line).map_err(|e| Error::io(e, path))
+}
+
+/// `barcodes.tsv`: full whitelist in sorted order (matches the raw matrix
+/// columns). Lists millions of lines, so the writer is buffered and the barcode
+/// is unpacked into a reused scratch buffer (no per-line allocation).
+fn write_barcodes(path: &Path, whitelist: &CbWhitelist, n: usize, gzip: bool) -> Result<(), Error> {
     let len = whitelist.barcode_len();
-    let mut line: Vec<u8> = Vec::with_capacity(len + 1);
-    for i in 0..n {
-        line.clear();
-        whitelist.unpack_barcode_into(i as u32, &mut line);
-        line.push(b'\n');
-        f.write_all(&line).map_err(|e| Error::io(e, path))?;
-    }
-    f.flush().map_err(|e| Error::io(e, path))
+    write_file(path, gzip, |w| {
+        let mut line: Vec<u8> = Vec::with_capacity(len + 1);
+        for i in 0..n {
+            write_one_barcode(w, whitelist, i as u32, &mut line, path)?;
+        }
+        Ok(())
+    })?;
+    Ok(())
+}
+
+/// `barcodes.tsv` for the filtered matrix: only the called-cell barcodes, in the
+/// same (cb-ascending) order as the filtered matrix columns.
+fn write_barcodes_subset(
+    path: &Path,
+    whitelist: &CbWhitelist,
+    cbs: &[u32],
+    gzip: bool,
+) -> Result<(), Error> {
+    let len = whitelist.barcode_len();
+    write_file(path, gzip, |w| {
+        let mut line: Vec<u8> = Vec::with_capacity(len + 1);
+        for &cb in cbs {
+            write_one_barcode(w, whitelist, cb, &mut line, path)?;
+        }
+        Ok(())
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -767,6 +971,34 @@ mod tests {
         assert_eq!(median_sorted(&[5]), 5);
         assert_eq!(median_sorted(&[1, 2, 3]), 2);
         assert_eq!(median_sorted(&[10, 20, 30, 40]), 25); // midpoint(20,30)
+    }
+
+    #[test]
+    fn called_cells_methods() {
+        let mk = |cb, u| CellStat {
+            cb,
+            n_reads: u,
+            n_umis: u,
+            n_genes: 1,
+        };
+        let cells = vec![mk(5, 1000), mk(2, 900), mk(8, 50), mk(1, 40)];
+        let s = |v: &[&str]| v.iter().map(ToString::to_string).collect::<Vec<_>>();
+
+        // TopCells 2: the two highest-UMI cells (cb 5, 2), returned cb-ascending.
+        assert_eq!(
+            called_cells(&cells, &s(&["TopCells", "2"])).unwrap(),
+            vec![2, 5]
+        );
+        // None: no filtered output.
+        assert!(called_cells(&cells, &s(&["None"])).is_none());
+        // CellRanger2.2: called cbs are sorted ascending.
+        let cr = called_cells(&cells, &s(&["CellRanger2.2", "3000", "0.99", "10"])).unwrap();
+        assert!(cr.windows(2).all(|w| w[0] < w[1]));
+        // EmptyDrops_CR falls back to the same knee here.
+        assert_eq!(
+            called_cells(&cells, &s(&["EmptyDrops_CR", "3000", "0.99", "10"])),
+            Some(cr)
+        );
     }
 
     #[test]

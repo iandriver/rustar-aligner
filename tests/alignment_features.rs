@@ -1007,6 +1007,25 @@ fn test_starsolo_gene_matrix() {
         *entry, "1 1 2",
         "expected 2 deduped molecules for G1 in cell 1"
     );
+
+    // The default --soloCellFilter (CellRanger2.2) also writes a filtered/ matrix
+    // containing only the called cell (the one assayed barcode), column-renumbered.
+    let filt = output_dir.join("Solo.out").join("Gene").join("filtered");
+    let f_barcodes = fs::read_to_string(filt.join("barcodes.tsv")).unwrap();
+    assert_eq!(f_barcodes.lines().count(), 1, "expected 1 filtered cell");
+    assert_eq!(f_barcodes.lines().next().unwrap(), cb);
+    let f_matrix = fs::read_to_string(filt.join("matrix.mtx")).unwrap();
+    let f_dims = f_matrix.lines().find(|l| !l.starts_with('%')).unwrap();
+    assert_eq!(f_dims, "1 1 1", "unexpected filtered matrix dimensions");
+    assert_eq!(f_matrix.lines().last().unwrap(), "1 1 2");
+
+    // A CellRanger-style summary is written per feature.
+    let summary =
+        fs::read_to_string(output_dir.join("Solo.out").join("Gene").join("Summary.csv")).unwrap();
+    assert!(
+        summary.contains("Estimated Number of Cells,1"),
+        "summary:\n{summary}"
+    );
 }
 
 // ---------------------------------------------------------------------------

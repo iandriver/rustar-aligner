@@ -771,6 +771,12 @@ pub struct Parameters {
     #[arg(long = "soloOutFileNames", num_args = 1.., default_values_t = vec!["Solo.out/".to_string(), "features.tsv".to_string(), "barcodes.tsv".to_string(), "matrix.mtx".to_string()])]
     pub solo_out_file_names: Vec<String>,
 
+    /// Gzip the solo `matrix.mtx` / `barcodes.tsv` / `features.tsv` and append a
+    /// `.gz` suffix (CellRanger-style output). Default `no` keeps the plain files
+    /// that STARsolo writes (so the byte-for-byte STARsolo comparison still holds).
+    #[arg(long = "soloOutGzip", default_value = "no")]
+    pub solo_out_gzip: String,
+
     /// Strand of the read relative to the gene for counting: Forward, Reverse, Unstranded.
     #[arg(long = "soloStrand", default_value = "Forward")]
     pub solo_strand: String,
