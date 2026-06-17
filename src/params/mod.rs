@@ -767,6 +767,12 @@ pub struct Parameters {
     #[arg(long = "soloCellFilter", num_args = 1.., default_values_t = vec!["CellRanger2.2".to_string(), "3000".to_string(), "0.99".to_string(), "10".to_string()])]
     pub solo_cell_filter: Vec<String>,
 
+    /// Counting method for reads mapping to multiple genes: Unique (default,
+    /// drop), Uniform, Rescue, PropUnique, EM. Non-Unique methods additionally
+    /// write `UniqueAndMult-<method>.mtx` (real-valued) per Gene/GeneFull feature.
+    #[arg(long = "soloMultiMappers", num_args = 1.., default_values_t = vec!["Unique".to_string()])]
+    pub solo_multi_mappers: Vec<String>,
+
     /// Output directory name for solo matrices (relative to `--outFileNamePrefix`).
     #[arg(long = "soloOutFileNames", num_args = 1.., default_values_t = vec!["Solo.out/".to_string(), "features.tsv".to_string(), "barcodes.tsv".to_string(), "matrix.mtx".to_string()])]
     pub solo_out_file_names: Vec<String>,
@@ -1072,17 +1078,22 @@ impl Parameters {
                     ),
                 ));
             }
-            // Only Gene / GeneFull are implemented (SJ, Velocyto, … are not yet).
+            // Gene / GeneFull / SJ are implemented (Velocyto, … are not yet).
             for f in &params.solo_features {
-                if f.parse::<crate::solo::SoloFeature>().is_err() {
+                if f != "SJ" && f.parse::<crate::solo::SoloFeature>().is_err() {
                     return Err(command.error(
                         ErrorKind::InvalidValue,
-                        format!("unsupported --soloFeatures '{f}'; supported: Gene, GeneFull"),
+                        format!("unsupported --soloFeatures '{f}'; supported: Gene, GeneFull, SJ"),
                     ));
                 }
             }
-            // Gene-level features need a gene model.
-            if !params.solo_features.is_empty() && params.sjdb_gtf_file.is_none() {
+            // Gene-level features need a gene model (SJ does not — junctions come
+            // from the alignments).
+            let needs_gtf = params
+                .solo_features
+                .iter()
+                .any(|f| f == "Gene" || f == "GeneFull");
+            if needs_gtf && params.sjdb_gtf_file.is_none() {
                 return Err(command.error(
                     ErrorKind::MissingRequiredArgument,
                     "--soloFeatures Gene/GeneFull requires --sjdbGTFfile (a gene model)",

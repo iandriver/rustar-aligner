@@ -352,35 +352,42 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
         info!("Wrote {}", quant_path.display());
     }
 
-    // STARsolo: report collected per-cell records. The count-matrix output
-    // (raw/matrix.mtx + barcodes.tsv + features.tsv) follows in Phase 14.4.
-    if let Some(ref sctx) = solo_ctx {
-        use std::sync::atomic::Ordering;
-        let s = &sctx.stats;
-        info!(
-            "STARsolo barcode stats: exact={} 1MM={} multiMM={} noMatch={} N-in-CB={} multReject={} N-in-UMI={} UMIhomopolymer={}",
-            s.yes_exact.load(Ordering::Relaxed),
-            s.yes_one_mm.load(Ordering::Relaxed),
-            s.yes_mult_mm.load(Ordering::Relaxed),
-            s.no_match.load(Ordering::Relaxed),
-            s.n_in_cb.load(Ordering::Relaxed),
-            s.mult_rejected.load(Ordering::Relaxed),
-            s.n_in_umi.load(Ordering::Relaxed),
-            s.umi_homopolymer.load(Ordering::Relaxed),
-        );
-        for (feature, recorder) in sctx.features.iter().zip(&sctx.recorders) {
-            info!(
-                "STARsolo {}: collected {} resolved (CB,UMI,gene) records ({} deferred 1MM_multi)",
-                feature.dir_name(),
-                recorder.n_records(),
-                recorder.n_multi_records(),
-            );
-        }
-        // Write the raw count matrix + Summary.csv per feature.
-        crate::solo::write_gene_matrix(sctx, &params, &stats)?;
-    }
-
     info!("Alignment complete!");
+    Ok(())
+}
+
+/// Log STARsolo barcode/record stats and write the per-cell matrices (raw +
+/// filtered), `Summary.csv`, and the SJ feature matrix. Called from the solo
+/// branch of `run_single_pass`, where `sj_stats` is live.
+fn write_solo_output(
+    sctx: &std::sync::Arc<crate::solo::SoloContext>,
+    params: &Parameters,
+    stats: &std::sync::Arc<crate::stats::AlignmentStats>,
+    sj_stats: &std::sync::Arc<crate::junction::SpliceJunctionStats>,
+    index: &std::sync::Arc<crate::index::GenomeIndex>,
+) -> anyhow::Result<()> {
+    use std::sync::atomic::Ordering;
+    let s = &sctx.stats;
+    info!(
+        "STARsolo barcode stats: exact={} 1MM={} multiMM={} noMatch={} N-in-CB={} multReject={} N-in-UMI={} UMIhomopolymer={}",
+        s.yes_exact.load(Ordering::Relaxed),
+        s.yes_one_mm.load(Ordering::Relaxed),
+        s.yes_mult_mm.load(Ordering::Relaxed),
+        s.no_match.load(Ordering::Relaxed),
+        s.n_in_cb.load(Ordering::Relaxed),
+        s.mult_rejected.load(Ordering::Relaxed),
+        s.n_in_umi.load(Ordering::Relaxed),
+        s.umi_homopolymer.load(Ordering::Relaxed),
+    );
+    for (feature, recorder) in sctx.features.iter().zip(&sctx.recorders) {
+        info!(
+            "STARsolo {}: collected {} resolved (CB,UMI,gene) records ({} deferred 1MM_multi)",
+            feature.dir_name(),
+            recorder.n_records(),
+            recorder.n_multi_records(),
+        );
+    }
+    crate::solo::write_gene_matrix(sctx, params, stats, Some(&**sj_stats), &index.genome)?;
     Ok(())
 }
 
@@ -520,6 +527,9 @@ fn run_single_pass(
         if !sj_stats.is_empty() {
             sj_stats.write_output(&sj_output_path, &index.genome, params)?;
         }
+        // Per-cell count matrices (raw + filtered), Summary.csv, and the SJ
+        // feature matrix — written here where sj_stats is available.
+        write_solo_output(sctx, params, &stats, &sj_stats, index)?;
         stats.print_summary();
         return Ok(stats);
     }
@@ -1452,6 +1462,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     struct SoloReadProduct {
         sam_records: BufferedSamRecords,
         per_feature: Vec<crate::solo::FeatureOutcome>,
+        sj: Vec<crate::solo::SjCountRecord>,
     }
 
     info!("STARsolo: aligning cDNA reads and quantifying barcodes...");
@@ -1491,10 +1502,11 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     stats.record_alignment(0, max_multimaps);
                     stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
                     // No alignment → barcode still counts toward stats (unmapped → no gene).
-                    let outcome = solo.process_read(&[], sread.barcode.as_ref());
+                    let outcome = solo.process_read(&[], sread.barcode.as_ref(), &[]);
                     return Ok(SoloReadProduct {
                         sam_records: buffer,
                         per_feature: outcome.per_feature,
+                        sj: outcome.sj,
                     });
                 }
 
@@ -1520,8 +1532,20 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     record_transcript_junctions(transcript, &index, &sj_stats, is_unique);
                 }
 
+                // SJ feature: the junctions crossed by a uniquely-mapped read
+                // (absolute intron coords), mapped to SJ.out.tab rows at output.
+                let junctions: Vec<(u64, u64)> =
+                    if solo.sj_enabled && is_unique && transcripts[0].n_junction > 0 {
+                        extract_junction_keys(&transcripts[0], &index)
+                            .into_iter()
+                            .map(|k| (k.intron_start, k.intron_end))
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
+
                 // Solo quantification (CB match + UMI check + gene assignment).
-                let outcome = solo.process_read(&transcripts, sread.barcode.as_ref());
+                let outcome = solo.process_read(&transcripts, sread.barcode.as_ref(), &junctions);
 
                 // Build SAM records for the cDNA alignment (same as SE path).
                 // Skipped entirely under `--outSAMtype None` (count-only).
@@ -1556,6 +1580,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                 Ok(SoloReadProduct {
                     sam_records: buffer,
                     per_feature: outcome.per_feature,
+                    sj: outcome.sj,
                 })
             })
             .collect();
@@ -1564,6 +1589,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
         let n_feat = solo.features.len();
         let mut feat_records: Vec<Vec<SoloCountRecord>> = (0..n_feat).map(|_| Vec::new()).collect();
         let mut feat_multi: Vec<Vec<SoloMultiRecord>> = (0..n_feat).map(|_| Vec::new()).collect();
+        let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
         for result in batch_results {
             let product = result?;
             writer.write_batch(&product.sam_records.records)?;
@@ -1575,12 +1601,16 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     feat_multi[fi].push(m);
                 }
             }
+            sj_batch.extend(product.sj);
         }
         for (fi, recorder) in solo.recorders.iter().enumerate() {
             recorder.extend(
                 std::mem::take(&mut feat_records[fi]),
                 std::mem::take(&mut feat_multi[fi]),
             );
+        }
+        if !sj_batch.is_empty() {
+            solo.sj_records.lock().unwrap().extend(sj_batch);
         }
 
         read_count += reads_to_process as u64;

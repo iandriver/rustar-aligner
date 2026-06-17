@@ -292,6 +292,17 @@ pub struct SoloCountRecord {
     pub gene: u32,
 }
 
+/// One (cell, UMI, splice-junction) observation for the `SJ` feature. The
+/// junction is identified by its absolute intron coordinates; it is mapped to a
+/// matrix row (the `SJ.out.tab` order) at output time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SjCountRecord {
+    pub cb: u32,
+    pub umi: u64,
+    pub intron_start: u64,
+    pub intron_end: u64,
+}
+
 /// A read whose cell barcode matched multiple whitelist entries by 1MM
 /// (`1MM_multi`). Resolution to a single CB needs the global exact-count table
 /// and is deferred to the collation stage (Phase 14.4).
@@ -358,6 +369,10 @@ pub struct SoloContext {
     /// (independent of barcode), populated only when both `Gene` and `GeneFull`
     /// features run.
     pub region_stats: RegionStats,
+    /// `--soloFeatures SJ`: collect per-cell splice-junction counts.
+    pub sj_enabled: bool,
+    /// (cell, UMI, junction) observations for the SJ feature.
+    pub sj_records: Mutex<Vec<SjCountRecord>>,
 }
 
 /// Per-region read tallies for the `Summary.csv` mapping funnel (uniquely-mapped
@@ -375,6 +390,9 @@ pub struct RegionStats {
 #[derive(Debug, Default)]
 pub struct SoloReadOutcome {
     pub per_feature: Vec<FeatureOutcome>,
+    /// SJ-feature records for this read (one per crossed junction); empty unless
+    /// `--soloFeatures SJ` and the read is uniquely mapped with a resolved CB.
+    pub sj: Vec<SjCountRecord>,
 }
 
 /// The record(s) one read produces for a single feature.
@@ -446,6 +464,7 @@ impl SoloContext {
         };
         let recorders = features.iter().map(|_| SoloRecorder::new()).collect();
         let feature_reads = features.iter().map(|_| AtomicU64::new(0)).collect();
+        let sj_enabled = params.solo_features.iter().any(|f| f == "SJ");
 
         Ok(Self {
             layout: SoloBarcodeLayout::from_params(params),
@@ -458,6 +477,8 @@ impl SoloContext {
             recorders,
             feature_reads,
             region_stats: RegionStats::default(),
+            sj_enabled,
+            sj_records: Mutex::new(Vec::new()),
         })
     }
 
@@ -468,6 +489,7 @@ impl SoloContext {
         &self,
         cdna_transcripts: &[Transcript],
         barcode: Option<&CellBarcode>,
+        junctions: &[(u64, u64)],
     ) -> SoloReadOutcome {
         let mut out = SoloReadOutcome::default();
 
@@ -533,6 +555,23 @@ impl SoloContext {
                 return out;
             }
         };
+
+        // SJ feature: record (cell, UMI, junction) for each crossed junction.
+        // Only for resolved CBs (1MM_multi deferral is not applied to SJ).
+        if self.sj_enabled
+            && !junctions.is_empty()
+            && let Some(cb) = cb_resolved
+        {
+            out.sj = junctions
+                .iter()
+                .map(|&(intron_start, intron_end)| SjCountRecord {
+                    cb,
+                    umi,
+                    intron_start,
+                    intron_end,
+                })
+                .collect();
+        }
 
         // The CB match + UMI are shared across features; reuse the cached
         // per-feature gene assignment from `classify_read`. One outcome/feature.

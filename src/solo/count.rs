@@ -580,6 +580,8 @@ pub fn write_gene_matrix(
     ctx: &SoloContext,
     params: &crate::params::Parameters,
     align_stats: &crate::stats::AlignmentStats,
+    sj_stats: Option<&crate::junction::SpliceJunctionStats>,
+    genome: &crate::genome::Genome,
 ) -> Result<(), Error> {
     let CbWhitelist::List { sorted, .. } = &ctx.whitelist else {
         log::warn!(
@@ -743,7 +745,114 @@ pub fn write_gene_matrix(
         )?;
         log::info!("STARsolo: wrote {}/Summary.csv", feature.dir_name());
     }
+
+    // SJ (splice-junction) feature: rows are the SJ.out.tab junctions.
+    if ctx.sj_enabled
+        && let Some(sjs) = sj_stats
+    {
+        let sj_dir = params.output_path(&format!("{solo_dir}SJ/raw/"));
+        std::fs::create_dir_all(&sj_dir).map_err(|e| Error::io(e, &sj_dir))?;
+        let order = sjs.sj_feature_order(params); // (intron_start, intron_end), row order
+        let row: HashMap<(u64, u64), u32> = order
+            .iter()
+            .enumerate()
+            .map(|(i, &k)| (k, i as u32))
+            .collect();
+        // features.tsv = the SJ.out.tab lines (same sorted order as the rows).
+        write_file(&sj_dir.join(&features_name), gzip, |w| {
+            sjs.write_sj_lines(w, genome, params).map(|_| ())
+        })?;
+        write_barcodes(
+            &sj_dir.join(&barcodes_name),
+            &ctx.whitelist,
+            sorted.len(),
+            gzip,
+        )?;
+        let umi_len = params.solo_umi_len as usize;
+        let nnz = build_sj_matrix(
+            &ctx.sj_records.lock().unwrap(),
+            &row,
+            method,
+            umi_len,
+            &sj_dir.join(&matrix_name),
+            order.len(),
+            sorted.len(),
+            gzip,
+        )?;
+        log::info!(
+            "STARsolo: wrote SJ/raw matrix ({} junctions × {} barcodes, {} entries)",
+            order.len(),
+            sorted.len(),
+            nnz,
+        );
+    }
     Ok(())
+}
+
+/// Build the SJ feature matrix from (cell, UMI, junction) records, mapping each
+/// junction's absolute intron coords to its `SJ.out.tab` row and UMI-collapsing
+/// per (cell, junction). Junctions not in `row` (filtered out of SJ.out.tab) are
+/// dropped. Same MatrixMarket layout as the gene matrix (junctions are rows).
+#[allow(clippy::too_many_arguments)]
+fn build_sj_matrix(
+    records: &[crate::solo::SjCountRecord],
+    row: &HashMap<(u64, u64), u32>,
+    method: UmiDedup,
+    umi_len: usize,
+    matrix_path: &Path,
+    n_junctions: usize,
+    n_barcodes: usize,
+    gzip: bool,
+) -> Result<usize, Error> {
+    // Group by cell barcode (ascending column order).
+    let mut recs: Vec<&crate::solo::SjCountRecord> = records.iter().collect();
+    recs.sort_unstable_by_key(|r| r.cb);
+
+    let dir = matrix_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut body_tmp = tempfile::Builder::new()
+        .prefix(".sj_body")
+        .tempfile_in(dir)
+        .map_err(|e| Error::io(e, dir))?;
+    let mut nnz = 0usize;
+    {
+        let mut body = std::io::BufWriter::new(body_tmp.as_file_mut());
+        let mut i = 0;
+        while i < recs.len() {
+            let cb = recs[i].cb;
+            // junction row → (umi → read count) for this cell.
+            let mut sj_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::new();
+            while i < recs.len() && recs[i].cb == cb {
+                let r = recs[i];
+                if let Some(&rw) = row.get(&(r.intron_start, r.intron_end)) {
+                    *sj_umis.entry(rw).or_default().entry(r.umi).or_insert(0) += 1;
+                }
+                i += 1;
+            }
+            let mut entries: Vec<(u32, u64)> = sj_umis
+                .into_iter()
+                .map(|(rw, umis)| (rw, dedup_count(&umis, method, umi_len)))
+                .filter(|&(_, c)| c > 0)
+                .collect();
+            entries.sort_unstable_by_key(|&(rw, _)| rw);
+            for (rw, c) in entries {
+                writeln!(body, "{} {} {}", rw + 1, cb + 1, c).map_err(|e| Error::io(e, dir))?;
+                nnz += 1;
+            }
+        }
+        body.flush().map_err(|e| Error::io(e, dir))?;
+    }
+
+    write_file(matrix_path, gzip, |w| {
+        writeln!(w, "%%MatrixMarket matrix coordinate integer general")
+            .map_err(|e| Error::io(e, matrix_path))?;
+        writeln!(w, "%").map_err(|e| Error::io(e, matrix_path))?;
+        writeln!(w, "{n_junctions} {n_barcodes} {nnz}").map_err(|e| Error::io(e, matrix_path))?;
+        let mut r =
+            std::fs::File::open(body_tmp.path()).map_err(|e| Error::io(e, body_tmp.path()))?;
+        std::io::copy(&mut r, w).map_err(|e| Error::io(e, matrix_path))?;
+        Ok(())
+    })?;
+    Ok(nnz)
 }
 
 /// CellRanger-style positional mapping bins over uniquely-mapped reads.

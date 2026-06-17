@@ -1029,6 +1029,92 @@ fn test_starsolo_gene_matrix() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9b — STARsolo SJ (splice-junction) feature
+//
+// Spliced cDNA reads (last 25 bp of Exon1 + first 25 bp of Exon2) cross the
+// planted GT-AG intron, producing one junction. --soloFeatures SJ must write a
+// Solo.out/SJ/raw matrix whose features.tsv equals SJ.out.tab and whose single
+// junction row carries the deduped molecule count for the one cell.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_sj_feature() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    let umi = "ACGTACGTAC";
+    // Spliced read: 25 bp from end of Exon1 + 25 bp from start of Exon2, which
+    // aligns across the intron [10050,10250) → one GT-AG junction.
+    let mut spliced = genome[10025..10050].to_vec();
+    spliced.extend_from_slice(&genome[10250..10275]);
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        for i in 0..6 {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(&spliced).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+            writeln!(bf, "@r{i}\n{cb}{umi}\n+\n{}", "I".repeat(26)).unwrap();
+        }
+        let mut wf = fs::File::create(&wl_path).unwrap();
+        writeln!(wf, "{cb}\nCCCCGGGGTTTTAAAA\nGGGGTTTTAAAACCCC").unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_sj");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloFeatures",
+            "Gene",
+            "SJ",
+            "--soloStrand",
+            "Forward",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let sj_raw = output_dir.join("Solo.out").join("SJ").join("raw");
+    let features = fs::read_to_string(sj_raw.join("features.tsv")).unwrap();
+    let sj_tab = fs::read_to_string(output_dir.join("SJ.out.tab")).unwrap();
+    // SJ feature file mirrors SJ.out.tab and contains exactly the one junction.
+    assert_eq!(features, sj_tab, "SJ features.tsv must equal SJ.out.tab");
+    assert_eq!(features.lines().count(), 1, "expected one junction");
+    assert!(
+        features.starts_with("chr1\t10051\t10250\t"),
+        "unexpected junction: {features}"
+    );
+    // Matrix: 1 junction × 3 barcodes, single entry "1 1 1" (one deduped molecule
+    // — all 6 reads share one UMI in one cell).
+    let matrix = fs::read_to_string(sj_raw.join("matrix.mtx")).unwrap();
+    let dims = matrix.lines().find(|l| !l.starts_with('%')).unwrap();
+    assert_eq!(dims, "1 3 1", "unexpected SJ matrix dims");
+    assert_eq!(matrix.lines().last().unwrap(), "1 1 1");
+}
+
+// ---------------------------------------------------------------------------
 // Test 10 — CellRanger-style STARsolo run (Phase 14.5)
 //
 // Exercises the full CellRanger 4.x/5.x flag set from STARsolo.md:
