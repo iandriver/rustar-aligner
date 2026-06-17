@@ -1115,6 +1115,110 @@ fn test_starsolo_sj_feature() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9c — STARsolo --soloMultiMappers (gene-ambiguous distribution)
+//
+// G1 and G3 share Exon1 (so a read there is ambiguous {G1,G3}); G2 has Exon2.
+// One cell has a unique G2 molecule + one ambiguous {G1,G3} molecule. The unique
+// matrix counts only G2; UniqueAndMult-Uniform spreads the ambiguous molecule
+// 0.5/0.5 to G1 and G3 while keeping G2 at 1.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_multimappers() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    // GTF order: G1, G3 (both Exon1), G2 (Exon2) → gene indices 0,1,2.
+    let gtf = tmpdir.path().join("multi.gtf");
+    {
+        let mut f = fs::File::create(&gtf).unwrap();
+        for g in ["G1", "G3"] {
+            writeln!(
+                f,
+                "chr1\tt\texon\t10001\t10050\t.\t+\t.\tgene_id \"{g}\"; transcript_id \"{g}t\";"
+            )
+            .unwrap();
+        }
+        writeln!(
+            f,
+            "chr1\tt\texon\t10251\t10300\t.\t+\t.\tgene_id \"G2\"; transcript_id \"G2t\";"
+        )
+        .unwrap();
+    }
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let barcode_path = tmpdir.path().join("barcode.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&barcode_path).unwrap();
+        // 4 reads in Exon2 → unique G2 (UMI a); 4 reads in Exon1 → ambiguous (UMI b).
+        let exon2 = &genome[10250..10300];
+        let exon1 = &genome[10000..10050];
+        for (i, (seq, umi)) in [(exon2, "ACGTACGTAC"), (exon1, "TGCATGCATG")]
+            .iter()
+            .flat_map(|x| std::iter::repeat_n(*x, 4))
+            .enumerate()
+        {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(seq).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+            writeln!(bf, "@r{i}\n{cb}{umi}\n+\n{}", "I".repeat(26)).unwrap();
+        }
+        let mut wf = fs::File::create(&wl_path).unwrap();
+        writeln!(wf, "{cb}\nCCCCGGGGTTTTAAAA\nGGGGTTTTAAAACCCC").unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_mm");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            barcode_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloFeatures",
+            "Gene",
+            "--soloStrand",
+            "Forward",
+            "--soloMultiMappers",
+            "Uniform",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let raw = output_dir.join("Solo.out").join("Gene").join("raw");
+    // Unique matrix: only G2 (gene index 2 → row 3), count 1.
+    let matrix = fs::read_to_string(raw.join("matrix.mtx")).unwrap();
+    assert_eq!(
+        matrix.lines().last().unwrap(),
+        "3 1 1",
+        "unique matrix:\n{matrix}"
+    );
+    // UniqueAndMult-Uniform: G1=0.5, G3=0.5, G2=1.
+    let um = fs::read_to_string(raw.join("UniqueAndMult-Uniform.mtx")).unwrap();
+    assert!(um.contains("coordinate real general"), "um header:\n{um}");
+    let rows: Vec<&str> = um.lines().filter(|l| !l.starts_with('%')).skip(1).collect();
+    assert!(rows.contains(&"1 1 0.50000"), "expected G1 0.5, got:\n{um}");
+    assert!(rows.contains(&"2 1 0.50000"), "expected G3 0.5, got:\n{um}");
+    assert!(rows.contains(&"3 1 1"), "expected G2 1, got:\n{um}");
+}
+
+// ---------------------------------------------------------------------------
 // Test 10 — CellRanger-style STARsolo run (Phase 14.5)
 //
 // Exercises the full CellRanger 4.x/5.x flag set from STARsolo.md:

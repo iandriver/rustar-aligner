@@ -1087,6 +1087,20 @@ impl Parameters {
                     ));
                 }
             }
+            // soloMultiMappers values.
+            for m in &params.solo_multi_mappers {
+                if !matches!(
+                    m.as_str(),
+                    "Unique" | "Uniform" | "Rescue" | "PropUnique" | "EM"
+                ) {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "unsupported --soloMultiMappers '{m}'; expected Unique, Uniform, Rescue, PropUnique, or EM"
+                        ),
+                    ));
+                }
+            }
             // Gene-level features need a gene model (SJ does not — junctions come
             // from the alignments).
             let needs_gtf = params

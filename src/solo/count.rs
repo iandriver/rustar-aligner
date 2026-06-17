@@ -492,6 +492,269 @@ fn finalize_matrix(
     Ok(nnz)
 }
 
+/// `--soloMultiMappers` method (non-`Unique` ones produce a `UniqueAndMult-*.mtx`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MultiMethod {
+    Uniform,
+    Rescue,
+    PropUnique,
+    Em,
+}
+
+impl MultiMethod {
+    fn name(self) -> &'static str {
+        match self {
+            MultiMethod::Uniform => "Uniform",
+            MultiMethod::Rescue => "Rescue",
+            MultiMethod::PropUnique => "PropUnique",
+            MultiMethod::Em => "EM",
+        }
+    }
+
+    /// Parse `--soloMultiMappers` values, dropping `Unique` (no extra matrix).
+    pub fn parse_list(vals: &[String]) -> Vec<MultiMethod> {
+        vals.iter()
+            .filter_map(|v| match v.as_str() {
+                "Uniform" => Some(MultiMethod::Uniform),
+                "Rescue" => Some(MultiMethod::Rescue),
+                "PropUnique" => Some(MultiMethod::PropUnique),
+                "EM" => Some(MultiMethod::Em),
+                _ => None,
+            })
+            .collect()
+    }
+}
+
+/// Distribute one cell's gene-ambiguous molecules across their gene sets and add
+/// to the unique counts `u`, returning the combined (unique + multi) per-gene
+/// counts. `molecules` is one gene set per deduplicated multi-gene UMI.
+fn distribute_multi(
+    method: MultiMethod,
+    u: &HashMap<u32, f64>,
+    molecules: &[Vec<u32>],
+) -> HashMap<u32, f64> {
+    let mut out = u.clone();
+    let unit = |s: &[u32]| 1.0 / s.len() as f64;
+    let get = |m: &HashMap<u32, f64>, g: u32| m.get(&g).copied().unwrap_or(0.0);
+    match method {
+        MultiMethod::Uniform => {
+            for s in molecules {
+                let w = unit(s);
+                for &g in s {
+                    *out.entry(g).or_insert(0.0) += w;
+                }
+            }
+        }
+        MultiMethod::PropUnique => {
+            for s in molecules {
+                let total: f64 = s.iter().map(|&g| get(u, g)).sum();
+                for &g in s {
+                    let w = if total > 0.0 {
+                        get(u, g) / total
+                    } else {
+                        unit(s)
+                    };
+                    *out.entry(g).or_insert(0.0) += w;
+                }
+            }
+        }
+        MultiMethod::Rescue => {
+            // Weights = unique counts + a uniform spread of the multi molecules.
+            let mut unif: HashMap<u32, f64> = HashMap::new();
+            for s in molecules {
+                let w = unit(s);
+                for &g in s {
+                    *unif.entry(g).or_insert(0.0) += w;
+                }
+            }
+            for s in molecules {
+                let total: f64 = s.iter().map(|&g| get(u, g) + get(&unif, g)).sum();
+                for &g in s {
+                    let w = if total > 0.0 {
+                        (get(u, g) + get(&unif, g)) / total
+                    } else {
+                        unit(s)
+                    };
+                    *out.entry(g).or_insert(0.0) += w;
+                }
+            }
+        }
+        MultiMethod::Em => {
+            // theta_g = u_g + (multi distributed proportional to theta), iterated.
+            let mut theta = u.clone();
+            for s in molecules {
+                for &g in s {
+                    theta.entry(g).or_insert(0.0);
+                }
+            }
+            for _ in 0..100 {
+                let mut next = u.clone();
+                for s in molecules {
+                    for &g in s {
+                        next.entry(g).or_insert(0.0);
+                    }
+                }
+                for s in molecules {
+                    let total: f64 = s.iter().map(|&g| get(&theta, g)).sum();
+                    for &g in s {
+                        let w = if total > 0.0 {
+                            get(&theta, g) / total
+                        } else {
+                            unit(s)
+                        };
+                        *next.get_mut(&g).unwrap() += w;
+                    }
+                }
+                let delta: f64 = next.iter().map(|(g, v)| (v - get(&theta, *g)).abs()).sum();
+                theta = next;
+                if delta < 1e-6 {
+                    break;
+                }
+            }
+            out = theta;
+        }
+    }
+    out
+}
+
+/// Format a real matrix value compactly (integers without a decimal point).
+fn fmt_real(v: f64) -> String {
+    if v.fract().abs() < 1e-9 {
+        format!("{}", v.round() as i64)
+    } else {
+        format!("{v:.5}")
+    }
+}
+
+/// Write the `UniqueAndMult-<method>.mtx` matrices (real-valued) for the
+/// `--soloMultiMappers` methods. Re-reads the raw matrix body (per-cell unique
+/// counts, cb-ascending) and merges each cell with its gene-ambiguous molecules
+/// (deduplicated by UMI, gene set = union). Cells present only in multi records
+/// (no unique gene) are skipped.
+#[allow(clippy::too_many_arguments)]
+fn build_multi_matrices(
+    raw_body: &tempfile::NamedTempFile,
+    multi_records: &[crate::solo::MultiGeneRecord],
+    methods: &[MultiMethod],
+    dir: &Path,
+    matrix_name: &str,
+    n_features: usize,
+    n_barcodes: usize,
+    gzip: bool,
+) -> Result<(), Error> {
+    if methods.is_empty() {
+        return Ok(());
+    }
+    let mut multi: Vec<&crate::solo::MultiGeneRecord> = multi_records.iter().collect();
+    multi.sort_unstable_by_key(|r| r.cb);
+
+    // Per-method temp body + entry count.
+    let mut bodies: Vec<tempfile::NamedTempFile> = Vec::new();
+    for _ in methods {
+        bodies.push(
+            tempfile::Builder::new()
+                .prefix(".um_body")
+                .tempfile_in(dir)
+                .map_err(|e| Error::io(e, dir))?,
+        );
+    }
+    let mut nnz = vec![0usize; methods.len()];
+
+    // Gather one cell's multi molecules (gene sets, one per deduped UMI).
+    let cell_molecules = |cb: u32, mptr: &mut usize| -> Vec<Vec<u32>> {
+        while *mptr < multi.len() && multi[*mptr].cb < cb {
+            *mptr += 1; // skip multi-only cells (no unique gene)
+        }
+        let mut by_umi: HashMap<u64, std::collections::BTreeSet<u32>> = HashMap::new();
+        while *mptr < multi.len() && multi[*mptr].cb == cb {
+            let r = multi[*mptr];
+            by_umi
+                .entry(r.umi)
+                .or_default()
+                .extend(r.genes.iter().copied());
+            *mptr += 1;
+        }
+        by_umi
+            .into_values()
+            .map(|s| s.into_iter().collect())
+            .collect()
+    };
+
+    {
+        let mut writers: Vec<std::io::BufWriter<&mut std::fs::File>> = bodies
+            .iter_mut()
+            .map(|t| std::io::BufWriter::new(t.as_file_mut()))
+            .collect();
+        let reader = BufReader::new(
+            std::fs::File::open(raw_body.path()).map_err(|e| Error::io(e, raw_body.path()))?,
+        );
+        let mut mptr = 0usize;
+        let mut cur_cb: Option<u32> = None;
+        let mut u_map: HashMap<u32, f64> = HashMap::new();
+
+        let mut flush = |cb: u32,
+                         u: &HashMap<u32, f64>,
+                         mptr: &mut usize,
+                         nnz: &mut [usize]|
+         -> Result<(), Error> {
+            let mols = cell_molecules(cb, mptr);
+            for (k, &m) in methods.iter().enumerate() {
+                let counts = distribute_multi(m, u, &mols);
+                let mut entries: Vec<(u32, f64)> =
+                    counts.into_iter().filter(|&(_, v)| v > 1e-9).collect();
+                entries.sort_unstable_by_key(|&(g, _)| g);
+                for (g, v) in entries {
+                    writeln!(writers[k], "{} {} {}", g + 1, cb + 1, fmt_real(v))
+                        .map_err(|e| Error::io(e, dir))?;
+                    nnz[k] += 1;
+                }
+            }
+            Ok(())
+        };
+
+        for line in reader.lines() {
+            let line = line.map_err(|e| Error::io(e, raw_body.path()))?;
+            let mut it = line.split(' ');
+            let (Some(gt), Some(ct), Some(vt)) = (it.next(), it.next(), it.next()) else {
+                continue;
+            };
+            let g: u32 = gt.parse::<u32>().unwrap_or(1) - 1;
+            let cb: u32 = ct.parse::<u32>().unwrap_or(1) - 1;
+            let v: f64 = vt.parse().unwrap_or(0.0);
+            if cur_cb != Some(cb) {
+                if let Some(prev) = cur_cb {
+                    flush(prev, &u_map, &mut mptr, &mut nnz)?;
+                }
+                cur_cb = Some(cb);
+                u_map.clear();
+            }
+            *u_map.entry(g).or_insert(0.0) += v;
+        }
+        if let Some(prev) = cur_cb {
+            flush(prev, &u_map, &mut mptr, &mut nnz)?;
+        }
+        for w in &mut writers {
+            w.flush().map_err(|e| Error::io(e, dir))?;
+        }
+    }
+
+    // Finalize each UniqueAndMult-<method>.mtx (real-valued MatrixMarket).
+    for ((m, body), &n) in methods.iter().zip(&bodies).zip(&nnz) {
+        let path = dir.join(format!("UniqueAndMult-{}.mtx", m.name()));
+        write_file(&path, gzip, |w| {
+            writeln!(w, "%%MatrixMarket matrix coordinate real general")
+                .map_err(|e| Error::io(e, &path))?;
+            writeln!(w, "%").map_err(|e| Error::io(e, &path))?;
+            writeln!(w, "{n_features} {n_barcodes} {n}").map_err(|e| Error::io(e, &path))?;
+            let mut r = std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?;
+            std::io::copy(&mut r, w).map_err(|e| Error::io(e, &path))?;
+            Ok(())
+        })?;
+    }
+    let _ = matrix_name; // UniqueAndMult uses a fixed name scheme
+    Ok(())
+}
+
 /// Apply `--soloUMIfiltering` to the gene→read_count map of a single UMI,
 /// returning the surviving (gene, read_count) entries.
 fn filter_multi_gene_umi(genes: &HashMap<u32, u32>, filtering: UmiFiltering) -> Vec<(&u32, &u32)> {
@@ -658,6 +921,7 @@ pub fn write_gene_matrix(
 
     let gzip = matches!(params.solo_out_gzip.as_str(), "yes" | "Yes" | "true");
     let n_genes = ctx.gene_ann.gene_ids.len();
+    let multi_methods = MultiMethod::parse_list(&params.solo_multi_mappers);
 
     // One {prefix}{soloOutFileNames[0]}<feature>/{raw,filtered}/ per feature.
     for (feature, recorder) in ctx.features.iter().zip(&ctx.recorders) {
@@ -729,6 +993,27 @@ pub fn write_gene_matrix(
                 feature.dir_name(),
                 cbs.len(),
                 fnnz,
+            );
+        }
+
+        // --soloMultiMappers: UniqueAndMult-<method>.mtx alongside raw.
+        if !multi_methods.is_empty() {
+            let mg = recorder.multi_gene.lock().unwrap();
+            build_multi_matrices(
+                &body,
+                &mg,
+                &multi_methods,
+                &raw_dir,
+                &matrix_name,
+                n_genes,
+                sorted.len(),
+                gzip,
+            )?;
+            log::info!(
+                "STARsolo: wrote {} UniqueAndMult matrices for {} ({} ambiguous reads)",
+                multi_methods.len(),
+                feature.dir_name(),
+                mg.len(),
             );
         }
 
@@ -1080,6 +1365,34 @@ mod tests {
         assert_eq!(median_sorted(&[5]), 5);
         assert_eq!(median_sorted(&[1, 2, 3]), 2);
         assert_eq!(median_sorted(&[10, 20, 30, 40]), 25); // midpoint(20,30)
+    }
+
+    #[test]
+    fn distribute_multi_methods() {
+        // Unique counts: gene 0 has 4, gene 1 has none. One ambiguous molecule
+        // maps to {0,1}.
+        let u: HashMap<u32, f64> = [(0u32, 4.0)].into_iter().collect();
+        let mols = vec![vec![0u32, 1u32]];
+
+        // Uniform: +0.5 to each gene in the set.
+        let uni = distribute_multi(MultiMethod::Uniform, &u, &mols);
+        assert!((uni[&0] - 4.5).abs() < 1e-9);
+        assert!((uni[&1] - 0.5).abs() < 1e-9);
+
+        // PropUnique: all weight to gene 0 (gene 1 has 0 unique) → 5 / 0.
+        let pu = distribute_multi(MultiMethod::PropUnique, &u, &mols);
+        assert!((pu[&0] - 5.0).abs() < 1e-9);
+        assert!(pu.get(&1).copied().unwrap_or(0.0).abs() < 1e-9);
+
+        // EM converges to all weight on gene 0 as well.
+        let em = distribute_multi(MultiMethod::Em, &u, &mols);
+        assert!((em[&0] - 5.0).abs() < 1e-6);
+        assert!(em.get(&1).copied().unwrap_or(0.0).abs() < 1e-6);
+
+        // With no unique evidence, PropUnique falls back to uniform.
+        let empty: HashMap<u32, f64> = HashMap::new();
+        let pu0 = distribute_multi(MultiMethod::PropUnique, &empty, &mols);
+        assert!((pu0[&0] - 0.5).abs() < 1e-9 && (pu0[&1] - 0.5).abs() < 1e-9);
     }
 
     #[test]

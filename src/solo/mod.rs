@@ -314,11 +314,22 @@ pub struct SoloMultiRecord {
     pub gene: u32,
 }
 
+/// A read that mapped to multiple genes (gene-ambiguous). Distributed across its
+/// gene set by `--soloMultiMappers` into the `UniqueAndMult-*.mtx` matrices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiGeneRecord {
+    pub cb: u32,
+    pub umi: u64,
+    pub genes: Vec<u32>,
+}
+
 /// Thread-safe sink for the records produced during alignment.
 #[derive(Default)]
 pub struct SoloRecorder {
     pub records: Mutex<Vec<SoloCountRecord>>,
     pub multi_records: Mutex<Vec<SoloMultiRecord>>,
+    /// Gene-ambiguous reads for `--soloMultiMappers` (resolved CB only).
+    pub multi_gene: Mutex<Vec<MultiGeneRecord>>,
 }
 
 impl SoloRecorder {
@@ -373,6 +384,9 @@ pub struct SoloContext {
     pub sj_enabled: bool,
     /// (cell, UMI, junction) observations for the SJ feature.
     pub sj_records: Mutex<Vec<SjCountRecord>>,
+    /// `--soloMultiMappers` includes a non-`Unique` method → capture gene-
+    /// ambiguous reads for distribution into `UniqueAndMult-*.mtx`.
+    pub want_multi: bool,
 }
 
 /// Per-region read tallies for the `Summary.csv` mapping funnel (uniquely-mapped
@@ -402,6 +416,8 @@ pub struct FeatureOutcome {
     pub record: Option<SoloCountRecord>,
     /// A deferred multi-CB record, if the CB was an unresolved 1MM_multi.
     pub multi: Option<SoloMultiRecord>,
+    /// A gene-ambiguous record (resolved CB), for `--soloMultiMappers`.
+    pub multi_gene: Option<MultiGeneRecord>,
 }
 
 impl SoloContext {
@@ -465,6 +481,7 @@ impl SoloContext {
         let recorders = features.iter().map(|_| SoloRecorder::new()).collect();
         let feature_reads = features.iter().map(|_| AtomicU64::new(0)).collect();
         let sj_enabled = params.solo_features.iter().any(|f| f == "SJ");
+        let want_multi = params.solo_multi_mappers.iter().any(|m| m != "Unique");
 
         Ok(Self {
             layout: SoloBarcodeLayout::from_params(params),
@@ -479,6 +496,7 @@ impl SoloContext {
             region_stats: RegionStats::default(),
             sj_enabled,
             sj_records: Mutex::new(Vec::new()),
+            want_multi,
         })
     }
 
@@ -504,6 +522,7 @@ impl SoloContext {
             self.strand,
             want_exon,
             want_body,
+            self.want_multi,
         );
 
         // Mapping funnel: count uniquely-mapped reads by region (CellRanger's
@@ -587,9 +606,25 @@ impl SoloContext {
                 };
                 let gene = match assignment {
                     GeneAssignment::Gene(g) => g,
-                    GeneAssignment::NoFeature
-                    | GeneAssignment::Ambiguous
-                    | GeneAssignment::Unmapped => return fo,
+                    GeneAssignment::Ambiguous => {
+                        // Gene-ambiguous read: record its gene set for
+                        // --soloMultiMappers distribution (resolved CB only).
+                        if let Some(cb) = cb_resolved {
+                            let genes = match feature {
+                                SoloFeature::Gene => &class.gene_multi,
+                                SoloFeature::GeneFull => &class.gene_full_multi,
+                            };
+                            if !genes.is_empty() {
+                                fo.multi_gene = Some(MultiGeneRecord {
+                                    cb,
+                                    umi,
+                                    genes: genes.clone(),
+                                });
+                            }
+                        }
+                        return fo;
+                    }
+                    GeneAssignment::NoFeature | GeneAssignment::Unmapped => return fo,
                 };
                 // Reads uniquely mapped to a gene under this feature, among
                 // valid-barcode reads (STARsolo "Reads Mapped to <feature>").

@@ -111,7 +111,7 @@ pub enum Region {
 /// the gene model (the two overlap queries are shared between the per-feature
 /// gene assignment and the region classification, so this costs no more than the
 /// old two `assign_gene_se` calls).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct ReadClass {
     /// Sense-strand exonic gene assignment (the `Gene` feature). `Unmapped` if
     /// exon overlap was not requested.
@@ -124,6 +124,12 @@ pub struct ReadClass {
     /// Read maps to a gene body on the antisense strand and to none on the sense
     /// strand (CellRanger's "Reads Mapped Antisense to Gene").
     pub antisense: bool,
+    /// Multi-gene set for the `Gene` feature (the sense exon genes), populated
+    /// only when `want_multi` and the read is gene-ambiguous (>1 gene). Used by
+    /// `--soloMultiMappers` to distribute the read; empty otherwise.
+    pub gene_multi: Vec<u32>,
+    /// Multi-gene set for the `GeneFull` feature (sense body genes).
+    pub gene_full_multi: Vec<u32>,
 }
 
 fn assignment_of(sense_genes: &[usize]) -> GeneAssignment {
@@ -143,6 +149,7 @@ pub fn classify_read(
     strand: SoloStrand,
     want_exon: bool,
     want_body: bool,
+    want_multi: bool,
 ) -> ReadClass {
     if transcripts.is_empty() {
         return ReadClass {
@@ -150,6 +157,8 @@ pub fn classify_read(
             gene_full: GeneAssignment::Unmapped,
             region: None,
             antisense: false,
+            gene_multi: Vec::new(),
+            gene_full_multi: Vec::new(),
         };
     }
 
@@ -210,6 +219,19 @@ pub fn classify_read(
                     None
                 };
 
+                // Capture the multi-gene sets only when requested and ambiguous,
+                // for --soloMultiMappers distribution.
+                let gene_multi = if want_multi && want_exon && exon_s.len() > 1 {
+                    exon_s.iter().map(|&g| g as u32).collect()
+                } else {
+                    Vec::new()
+                };
+                let gene_full_multi = if want_multi && want_body && body_s.len() > 1 {
+                    body_s.iter().map(|&g| g as u32).collect()
+                } else {
+                    Vec::new()
+                };
+
                 ReadClass {
                     gene: if want_exon {
                         assignment_of(&exon_s)
@@ -223,6 +245,8 @@ pub fn classify_read(
                     },
                     region,
                     antisense: body_anti_any && body_s.is_empty(),
+                    gene_multi,
+                    gene_full_multi,
                 }
             })
         })
@@ -239,7 +263,7 @@ pub fn assign_gene_se(
     feature: SoloFeature,
 ) -> GeneAssignment {
     let want_exon = feature == SoloFeature::Gene;
-    let class = classify_read(transcripts, gene_ann, strand, want_exon, !want_exon);
+    let class = classify_read(transcripts, gene_ann, strand, want_exon, !want_exon, false);
     match feature {
         SoloFeature::Gene => class.gene,
         SoloFeature::GeneFull => class.gene_full,
@@ -428,6 +452,7 @@ mod tests {
                 SoloStrand::Forward,
                 true,
                 true,
+                false,
             )
         };
 
@@ -457,6 +482,7 @@ mod tests {
                 &ann,
                 SoloStrand::Forward,
                 true,
+                false,
                 false
             )
             .region,

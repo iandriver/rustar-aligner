@@ -1589,6 +1589,8 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
         let n_feat = solo.features.len();
         let mut feat_records: Vec<Vec<SoloCountRecord>> = (0..n_feat).map(|_| Vec::new()).collect();
         let mut feat_multi: Vec<Vec<SoloMultiRecord>> = (0..n_feat).map(|_| Vec::new()).collect();
+        let mut feat_multi_gene: Vec<Vec<crate::solo::MultiGeneRecord>> =
+            (0..n_feat).map(|_| Vec::new()).collect();
         let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
         for result in batch_results {
             let product = result?;
@@ -1600,6 +1602,9 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                 if let Some(m) = fo.multi {
                     feat_multi[fi].push(m);
                 }
+                if let Some(mg) = fo.multi_gene {
+                    feat_multi_gene[fi].push(mg);
+                }
             }
             sj_batch.extend(product.sj);
         }
@@ -1608,6 +1613,10 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                 std::mem::take(&mut feat_records[fi]),
                 std::mem::take(&mut feat_multi[fi]),
             );
+            let mg = std::mem::take(&mut feat_multi_gene[fi]);
+            if !mg.is_empty() {
+                recorder.multi_gene.lock().unwrap().extend(mg);
+            }
         }
         if !sj_batch.is_empty() {
             solo.sj_records.lock().unwrap().extend(sj_batch);
