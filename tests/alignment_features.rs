@@ -1219,6 +1219,79 @@ fn test_starsolo_multimappers() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9d — STARsolo SmartSeq (plate-based, manifest, no UMI)
+//
+// Two "cells" (manifest entries) of Exon1 reads → gene G1. With no UMIs each read
+// is a count, so the matrix is G1 × {CellA,CellB} = read counts (5, 3).
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_smartseq() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let exon1 = &genome[10000..10050];
+    let write_cell = |name: &str, n: usize| -> PathBuf {
+        let p = tmpdir.path().join(name);
+        let mut f = fs::File::create(&p).unwrap();
+        for i in 0..n {
+            writeln!(f, "@{name}_{i}").unwrap();
+            f.write_all(exon1).unwrap();
+            writeln!(f, "\n+\n{}", "I".repeat(50)).unwrap();
+        }
+        p
+    };
+    let a = write_cell("cellA.fq", 5);
+    let b = write_cell("cellB.fq", 3);
+    let manifest = tmpdir.path().join("manifest.tsv");
+    fs::write(
+        &manifest,
+        format!("{}\t-\tCellA\n{}\t-\tCellB\n", a.display(), b.display()),
+    )
+    .unwrap();
+
+    let output_dir = tmpdir.path().join("out_ss");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--soloType",
+            "SmartSeq",
+            "--readFilesManifest",
+            manifest.to_str().unwrap(),
+            "--soloStrand",
+            "Forward",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let raw = output_dir.join("Solo.out").join("Gene").join("raw");
+    let barcodes = fs::read_to_string(raw.join("barcodes.tsv")).unwrap();
+    assert_eq!(barcodes, "CellA\nCellB\n");
+    let matrix = fs::read_to_string(raw.join("matrix.mtx")).unwrap();
+    let dims = matrix.lines().find(|l| !l.starts_with('%')).unwrap();
+    assert_eq!(dims, "1 2 2", "SmartSeq matrix dims:\n{matrix}");
+    let entries: Vec<&str> = matrix
+        .lines()
+        .filter(|l| !l.starts_with('%'))
+        .skip(1)
+        .collect();
+    assert!(entries.contains(&"1 1 5"), "expected CellA G1=5:\n{matrix}");
+    assert!(entries.contains(&"1 2 3"), "expected CellB G1=3:\n{matrix}");
+}
+
+// ---------------------------------------------------------------------------
 // Test 10 — CellRanger-style STARsolo run (Phase 14.5)
 //
 // Exercises the full CellRanger 4.x/5.x flag set from STARsolo.md:

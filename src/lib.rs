@@ -218,8 +218,8 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
         info!("Using single-threaded mode");
     }
 
-    // Validate read files
-    if params.read_files_in.is_empty() {
+    // Validate read files (SmartSeq supplies reads via --readFilesManifest).
+    if params.read_files_in.is_empty() && params.solo_type != params::SoloType::SmartSeq {
         anyhow::bail!("No read files specified (--readFilesIn)");
     }
 
@@ -279,7 +279,24 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
             None
         };
 
-    // Build the STARsolo context (whitelist + gene model) if a solo run.
+    // SmartSeq has no barcodes/UMIs — a dedicated manifest-driven path.
+    if params.solo_type == params::SoloType::SmartSeq {
+        let stats = run_smartseq(&index, &params)?;
+        let log_path = params.output_path("Log.final.out");
+        if let Some(parent) = log_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        stats.write_log_final(
+            &log_path,
+            time_start,
+            chrono::Local::now(),
+            chrono::Local::now(),
+        )?;
+        info!("Alignment complete!");
+        return Ok(());
+    }
+
+    // Build the STARsolo context (whitelist + gene model) if a droplet solo run.
     let solo_ctx: Option<std::sync::Arc<crate::solo::SoloContext>> = if params.solo_enabled() {
         info!(
             "STARsolo: soloType={} — building barcode + gene context",
@@ -389,6 +406,108 @@ fn write_solo_output(
     }
     crate::solo::write_gene_matrix(sctx, params, stats, Some(&**sj_stats), &index.genome)?;
     Ok(())
+}
+
+/// `--soloType SmartSeq`: align each manifest cell's reads and count reads per
+/// gene (no barcodes, no UMIs). Writes `Solo.out/Gene/raw/` (genes × cells) and
+/// returns the alignment stats.
+fn run_smartseq(
+    index: &std::sync::Arc<crate::index::GenomeIndex>,
+    params: &Parameters,
+) -> anyhow::Result<std::sync::Arc<crate::stats::AlignmentStats>> {
+    use crate::align::read_align::align_read;
+    use crate::solo::{GeneAssignment, SoloStrand, classify_read};
+    use rayon::prelude::*;
+    use std::sync::Arc;
+
+    let manifest = params
+        .read_files_manifest
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("--soloType SmartSeq requires --readFilesManifest"))?;
+    let cells = crate::solo::smartseq::parse_manifest(manifest)?;
+    info!(
+        "STARsolo SmartSeq: {} cells from {}",
+        cells.len(),
+        manifest.display()
+    );
+
+    let gtf = params.sjdb_gtf_file.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("--soloType SmartSeq Gene counting requires --sjdbGTFfile")
+    })?;
+    let exons = crate::junction::gtf::parse_gtf_configured(
+        gtf,
+        &params.sjdb_gtf_feature_exon,
+        &params.sjdb_gtf_chr_prefix,
+    )?;
+    let gene_ann = crate::quant::GeneAnnotation::from_gtf_exons_configured(
+        &exons,
+        &index.genome,
+        &params.sjdb_gtf_tag_exon_parent_gene,
+    );
+    info!(
+        "STARsolo SmartSeq: {} genes from {}",
+        gene_ann.n_genes(),
+        gtf.display()
+    );
+    let strand: SoloStrand = params.solo_strand.parse().unwrap_or_default();
+    let max_multimaps = params.out_filter_multimap_nmax as usize;
+
+    let stats = Arc::new(crate::stats::AlignmentStats::new());
+    let cell_ids: Vec<String> = cells.iter().map(|c| c.cell_id.clone()).collect();
+    let counts = crate::solo::smartseq::SmartSeqCounts::new(cell_ids, gene_ann.gene_ids.len());
+
+    for (ci, cell) in cells.iter().enumerate() {
+        let mut reader =
+            crate::io::fastq::FastqReader::open(&cell.read1, params.read_files_command.as_deref())?;
+        loop {
+            let batch = reader.read_batch(10_000)?;
+            if batch.is_empty() {
+                break;
+            }
+            batch.par_iter().for_each(|read| {
+                stats.record_read_bases(read.sequence.len() as u64);
+                let Ok((transcripts, _chim, n_for_mapq, reason)) =
+                    align_read(&read.sequence, &read.name, index, params)
+                else {
+                    return;
+                };
+                let n = if transcripts.is_empty() && n_for_mapq > 0 {
+                    n_for_mapq
+                } else {
+                    transcripts.len()
+                };
+                stats.record_alignment(n, max_multimaps);
+                if transcripts.is_empty() {
+                    stats.record_unmapped_reason(
+                        reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                    );
+                } else if transcripts.len() == 1 {
+                    stats.record_transcript_stats(&transcripts[0]);
+                }
+                let class = classify_read(&transcripts, &gene_ann, strand, true, false, false);
+                if let GeneAssignment::Gene(g) = class.gene {
+                    counts.add(ci, g);
+                }
+            });
+        }
+    }
+
+    let solo_dir = params
+        .solo_out_file_names
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "Solo.out/".to_string());
+    let raw_dir = params.output_path(&format!("{solo_dir}Gene/raw/"));
+    let gzip = matches!(params.solo_out_gzip.as_str(), "yes" | "Yes" | "true");
+    let nnz = counts.write_matrix(&raw_dir, &gene_ann.gene_ids, gzip)?;
+    info!(
+        "STARsolo SmartSeq: wrote Gene/raw matrix ({} genes × {} cells, {} entries)",
+        gene_ann.n_genes(),
+        cells.len(),
+        nnz,
+    );
+    stats.print_summary();
+    Ok(stats)
 }
 
 /// Run single-pass alignment (original logic)

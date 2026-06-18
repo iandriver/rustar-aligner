@@ -22,7 +22,7 @@ use std::str::FromStr;
 /// Open a solo output file, gzipping it (and appending `.gz` to the name) when
 /// `gzip` is set. The body is written by the closure; the gzip stream is
 /// finished explicitly so the trailer is always flushed. Returns the path written.
-fn write_file<F>(path: &Path, gzip: bool, body: F) -> Result<PathBuf, Error>
+pub(crate) fn write_file<F>(path: &Path, gzip: bool, body: F) -> Result<PathBuf, Error>
 where
     F: FnOnce(&mut dyn std::io::Write) -> Result<(), Error>,
 {

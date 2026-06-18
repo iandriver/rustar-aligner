@@ -11,6 +11,7 @@
 
 pub mod count;
 pub mod gene;
+pub mod smartseq;
 pub mod whitelist;
 
 pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};

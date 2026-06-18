@@ -340,6 +340,12 @@ pub struct Parameters {
     #[arg(long = "readFilesCommand")]
     pub read_files_command: Option<String>,
 
+    /// `--soloType SmartSeq` manifest: a TSV with `read1 <TAB> read2 <TAB> cellID`
+    /// per line (`read2` = `-` for single-end). Each line is one plate-well cell;
+    /// reads are counted per gene with no UMI.
+    #[arg(long = "readFilesManifest")]
+    pub read_files_manifest: Option<PathBuf>,
+
     /// Number of reads to map; -1 = all
     #[arg(long = "readMapNumber", default_value_t = -1, allow_hyphen_values = true)]
     pub read_map_number: i64,
@@ -998,8 +1004,12 @@ impl Parameters {
             ));
         }
 
-        // alignReads requires read files
-        if params.run_mode == RunMode::AlignReads && params.read_files_in.is_empty() {
+        // alignReads requires read files — except SmartSeq, which gets its reads
+        // from --readFilesManifest instead.
+        if params.run_mode == RunMode::AlignReads
+            && params.read_files_in.is_empty()
+            && params.solo_type != SoloType::SmartSeq
+        {
             return Err(command.error(
                 ErrorKind::MissingRequiredArgument,
                 "--readFilesIn is required when --runMode alignReads",
@@ -1061,9 +1071,14 @@ impl Parameters {
 
         // ── STARsolo validation ─────────────────────────────────────────
         if params.run_mode == RunMode::AlignReads && params.solo_enabled() {
+            // SmartSeq is plate-based (one library per manifest cell, no barcodes).
+            if params.solo_type == SoloType::SmartSeq && params.read_files_manifest.is_none() {
+                return Err(command.error(
+                    ErrorKind::MissingRequiredArgument,
+                    "--soloType SmartSeq requires --readFilesManifest (a TSV of read1<TAB>read2<TAB>cellID per cell)",
+                ));
+            }
             // CB_UMI_Simple needs exactly two read files: cDNA + barcode read.
-            // (SmartSeq is plate-based and is handled differently; it is not
-            // yet implemented, so we only enforce the droplet geometry here.)
             if matches!(
                 params.solo_type,
                 SoloType::CbUmiSimple | SoloType::CbUmiComplex | SoloType::CbSamTagOut
@@ -1196,8 +1211,12 @@ impl Parameters {
                     ),
                 ));
             }
-            // A whitelist is required for any correction beyond None.
-            if params.solo_cb_whitelist_none() && params.solo_cb_match_wl_type != "Exact" {
+            // A whitelist is required for any correction beyond None (SmartSeq
+            // has no cell barcodes at all, so the rule does not apply).
+            if params.solo_type != SoloType::SmartSeq
+                && params.solo_cb_whitelist_none()
+                && params.solo_cb_match_wl_type != "Exact"
+            {
                 return Err(command.error(
                     ErrorKind::InvalidValue,
                     "--soloCBwhitelist None requires --soloCBmatchWLtype Exact (no correction possible without a whitelist)",
