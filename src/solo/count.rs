@@ -801,12 +801,9 @@ fn called_cells(cells: &[CellStat], filter: &[String]) -> Option<Vec<u32>> {
             idx.sort_by(|a, b| b.n_umis.cmp(&a.n_umis).then(a.cb.cmp(&b.cb)));
             idx.into_iter().take(n).map(|c| c.cb).collect()
         }
+        // EmptyDrops_CR is handled by `emptydrops_called`; the knee here is the
+        // fallback / guaranteed-cell base.
         "CellRanger2.2" | "EmptyDrops_CR" => {
-            if method == "EmptyDrops_CR" {
-                log::warn!(
-                    "--soloCellFilter EmptyDrops_CR: writing knee-called cells; run the `emptydrops` binary on raw/ for the Monte-Carlo rescue"
-                );
-            }
             let mut umis: Vec<u64> = cells.iter().map(|c| c.n_umis).collect();
             umis.sort_unstable_by(|a, b| b.cmp(a));
             let thr = knee_cr22(&umis, arg(1, 3000.0) as usize, arg(2, 0.99), arg(3, 10.0));
@@ -823,6 +820,191 @@ fn called_cells(cells: &[CellStat], filter: &[String]) -> Option<Vec<u32>> {
     };
     cbs.sort_unstable();
     Some(cbs)
+}
+
+/// `--soloCellFilter EmptyDrops_CR`: the CR2.2-knee guaranteed cells PLUS cells
+/// rescued by the EmptyDrops multinomial Monte-Carlo test (STAR
+/// `SoloFeature_emptyDrops_CR.cpp`). Per-cell gene profiles for the ambient +
+/// candidate cells are read back from the raw matrix body. `filter` is the
+/// `EmptyDrops_CR nExpected maxPct maxMinRatio indMin indMax umiMin
+/// umiMinFracMedian candMaxN FDR [simN]` argument list.
+fn emptydrops_called(
+    cells: &[CellStat],
+    body: &tempfile::NamedTempFile,
+    n_features: usize,
+    filter: &[String],
+) -> Result<Vec<u32>, Error> {
+    use rand::SeedableRng;
+    use rand::distr::{Distribution, weighted::WeightedIndex};
+    let arg = |i: usize, d: f64| {
+        filter
+            .get(i)
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(d)
+    };
+    let (n_expected, max_pct, ratio) = (arg(1, 3000.0) as usize, arg(2, 0.99), arg(3, 10.0));
+    let (ind_min, ind_max) = (arg(4, 45000.0) as usize, arg(5, 90000.0) as usize);
+    let umi_min = arg(6, 500.0) as u64;
+    let umi_min_frac = arg(7, 0.01);
+    let cand_max = arg(8, 20000.0) as usize;
+    let fdr = arg(9, 0.01);
+    let sim_n = arg(10, 10000.0).max(1.0) as usize;
+
+    // Rank by total UMI (descending, cb tie-break).
+    let mut order: Vec<&CellStat> = cells.iter().collect();
+    order.sort_by(|a, b| b.n_umis.cmp(&a.n_umis).then(a.cb.cmp(&b.cb)));
+    let totals_desc: Vec<u64> = order.iter().map(|c| c.n_umis).collect();
+    let thr = knee_cr22(&totals_desc, n_expected, max_pct, ratio);
+    let n_simple = totals_desc.iter().take_while(|&&u| u >= thr).count();
+    let mut called: Vec<u32> = order.iter().take(n_simple).map(|c| c.cb).collect();
+
+    // Candidate cells: rank ≥ nSimple, total ≥ minUMI, up to candMaxN.
+    let median_top = totals_desc.get(n_simple / 2).copied().unwrap_or(0);
+    let min_umi = umi_min.max((umi_min_frac * median_top as f64) as u64);
+    let mut cand_cbs: Vec<u32> = Vec::new();
+    for c in order.iter().skip(n_simple).take(cand_max) {
+        if c.n_umis < min_umi {
+            break;
+        }
+        cand_cbs.push(c.cb);
+    }
+    if cand_cbs.is_empty() {
+        called.sort_unstable();
+        return Ok(called);
+    }
+    let cand_set: std::collections::HashSet<u32> = cand_cbs.iter().copied().collect();
+    let ambient_set: std::collections::HashSet<u32> = order
+        .iter()
+        .skip(ind_min)
+        .take(ind_max.saturating_sub(ind_min))
+        .map(|c| c.cb)
+        .collect();
+
+    // Re-read the raw body for ambient (summed) + per-candidate profiles.
+    let mut ambient = vec![0f64; n_features];
+    let mut amb_total = 0f64;
+    let mut cand_profiles: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    let reader =
+        BufReader::new(std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?);
+    for line in reader.lines() {
+        let line = line.map_err(|e| Error::io(e, body.path()))?;
+        let mut it = line.split(' ');
+        let (Some(gt), Some(ct), Some(vt)) = (it.next(), it.next(), it.next()) else {
+            continue;
+        };
+        let g = gt.parse::<u32>().unwrap_or(1) - 1;
+        let cb = ct.parse::<u32>().unwrap_or(1) - 1;
+        let v = vt.parse::<u32>().unwrap_or(0);
+        if ambient_set.contains(&cb) {
+            ambient[g as usize] += v as f64;
+            amb_total += v as f64;
+        }
+        if cand_set.contains(&cb) {
+            cand_profiles.entry(cb).or_default().push((g, v));
+        }
+    }
+    if amb_total == 0.0 {
+        called.sort_unstable();
+        return Ok(called);
+    }
+
+    // Ambient probabilities with a Good-Turing P0 unseen-mass correction.
+    let n1 = ambient.iter().filter(|&&x| (x - 1.0).abs() < 0.5).count() as f64;
+    let p0 = (n1 / amb_total).clamp(1e-12, 0.5);
+    let n_zero = ambient.iter().filter(|&&x| x == 0.0).count().max(1) as f64;
+    let amb_p: Vec<f64> = ambient
+        .iter()
+        .map(|&x| {
+            if x > 0.0 {
+                (1.0 - p0) * x / amb_total
+            } else {
+                p0 / n_zero
+            }
+        })
+        .collect();
+    let amb_logp: Vec<f64> = amb_p.iter().map(|&p| p.max(1e-300).ln()).collect();
+
+    // Observed multinomial log-prob per candidate.
+    let max_count = cand_cbs
+        .iter()
+        .filter_map(|cb| cand_profiles.get(cb))
+        .map(|p| p.iter().map(|&(_, c)| c as usize).sum::<usize>())
+        .max()
+        .unwrap_or(0);
+    let mut log_fac = vec![0f64; max_count + 1];
+    for i in 2..=max_count {
+        log_fac[i] = log_fac[i - 1] + (i as f64).ln();
+    }
+    let obs: Vec<(u32, usize, f64)> = cand_cbs
+        .iter()
+        .filter_map(|&cb| {
+            let prof = cand_profiles.get(&cb)?;
+            let total: usize = prof.iter().map(|&(_, c)| c as usize).sum();
+            let mut s = log_fac[total];
+            for &(g, c) in prof {
+                s -= log_fac[c as usize];
+                s += c as f64 * amb_logp[g as usize];
+            }
+            Some((cb, total, s))
+        })
+        .collect();
+
+    // Monte-Carlo: simulate sim_n ambient barcodes, recording the running
+    // log-prob at each count; compare each candidate against sim[*][its total].
+    let nonzero: Vec<usize> = (0..n_features).filter(|&g| amb_p[g] > 0.0).collect();
+    let weights: Vec<f64> = nonzero.iter().map(|&g| amb_p[g]).collect();
+    let dist = WeightedIndex::new(&weights).map_err(|e| {
+        Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            e.to_string(),
+        ))
+    })?;
+    let mut rng = rand::rngs::StdRng::seed_from_u64(19_760_110);
+    let mut sim_at: Vec<Vec<f64>> = vec![Vec::with_capacity(sim_n); max_count + 1];
+    let mut curr = vec![0u32; n_features];
+    for _ in 0..sim_n {
+        curr.fill(0);
+        let mut lp = 0f64;
+        sim_at[0].push(0.0);
+        #[allow(clippy::needless_range_loop)] // ic is both index and multinomial term
+        for ic in 1..=max_count {
+            let gi = nonzero[dist.sample(&mut rng)];
+            curr[gi] += 1;
+            lp += amb_logp[gi] + (ic as f64).ln() - (curr[gi] as f64).ln();
+            sim_at[ic].push(lp);
+        }
+    }
+
+    // p-values + Benjamini-Hochberg.
+    let mut pvals: Vec<(u32, f64)> = obs
+        .iter()
+        .map(|&(cb, total, o)| {
+            let lower = sim_at[total].iter().filter(|&&sp| sp < o).count();
+            (cb, (1 + lower) as f64 / (1 + sim_n) as f64)
+        })
+        .collect();
+    pvals.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    let n = pvals.len() as f64;
+    let mut padj = vec![0f64; pvals.len()];
+    for (rank, &(_, p)) in pvals.iter().enumerate() {
+        padj[rank] = (p * n / (rank + 1) as f64).min(1.0);
+    }
+    for i in (0..padj.len().saturating_sub(1)).rev() {
+        padj[i] = padj[i].min(padj[i + 1]);
+    }
+    let mut rescued = 0usize;
+    for (rank, &(cb, _)) in pvals.iter().enumerate() {
+        if padj[rank] <= fdr {
+            called.push(cb);
+            rescued += 1;
+        }
+    }
+    log::info!(
+        "EmptyDrops_CR: {n_simple} knee cells + {rescued} rescued (of {} candidates, FDR<={fdr})",
+        cand_cbs.len()
+    );
+    called.sort_unstable();
+    Ok(called)
 }
 
 /// Median of an ascending-sorted slice (0 if empty).
@@ -966,8 +1148,23 @@ pub fn write_gene_matrix(
             if gzip { " [gzip]" } else { "" },
         );
 
-        // Filtered (cell-called) matrix per --soloCellFilter.
-        if let Some(cbs) = called_cells(&mstats.cells, &params.solo_cell_filter)
+        // Filtered (cell-called) matrix per --soloCellFilter. EmptyDrops_CR runs
+        // the Monte-Carlo rescue (needs the per-cell profiles in the body).
+        let called = if params
+            .solo_cell_filter
+            .first()
+            .is_some_and(|m| m == "EmptyDrops_CR")
+        {
+            Some(emptydrops_called(
+                &mstats.cells,
+                &body,
+                n_genes,
+                &params.solo_cell_filter,
+            )?)
+        } else {
+            called_cells(&mstats.cells, &params.solo_cell_filter)
+        };
+        if let Some(cbs) = called
             && !cbs.is_empty()
         {
             let filt_dir = feature_dir.join("filtered");
