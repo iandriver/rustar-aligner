@@ -1292,6 +1292,92 @@ fn test_starsolo_smartseq() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9e — STARsolo CB_UMI_Complex (multi-segment barcode)
+//
+// Barcode read layout: seg1(2bp) + linker(2bp) + seg2(2bp) + UMI(2bp). The cell
+// barcode is seg1++seg2 matched against the cartesian product of two segment
+// whitelists. All reads share CB=AAGG / UMI=AT → one molecule for gene G1.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_cb_umi_complex() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let bc_path = tmpdir.path().join("bc.fq");
+    let wl1 = tmpdir.path().join("wl1.txt");
+    let wl2 = tmpdir.path().join("wl2.txt");
+    fs::write(&wl1, "AA\nCC\n").unwrap(); // seg1 whitelist
+    fs::write(&wl2, "GG\nTT\n").unwrap(); // seg2 whitelist
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&bc_path).unwrap();
+        let exon1 = &genome[10000..10050];
+        for i in 0..4 {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(exon1).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(50)).unwrap();
+            // seg1=AA, linker=CC, seg2=GG, UMI=AT → CB "AAGG", UMI "AT".
+            writeln!(bf, "@r{i}\nAACCGGAT\n+\nIIIIIIII").unwrap();
+        }
+    }
+
+    let output_dir = tmpdir.path().join("out_cx");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            bc_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Complex",
+            "--soloCBwhitelist",
+            wl1.to_str().unwrap(),
+            wl2.to_str().unwrap(),
+            "--soloCBposition",
+            "0_0_0_1",
+            "0_4_0_5",
+            "--soloUMIposition",
+            "0_6_0_7",
+            "--soloUMIlen",
+            "2",
+            "--soloCBmatchWLtype",
+            "Exact",
+            "--soloFeatures",
+            "Gene",
+            "--soloStrand",
+            "Forward",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let raw = output_dir.join("Solo.out").join("Gene").join("raw");
+    // Combined whitelist = {AA,CC}×{GG,TT} = 4 barcodes. The matched cell is AAGG;
+    // all 4 reads share UMI AT → one molecule for G1.
+    let matrix = fs::read_to_string(raw.join("matrix.mtx")).unwrap();
+    let dims = matrix.lines().find(|l| !l.starts_with('%')).unwrap();
+    let parts: Vec<&str> = dims.split_whitespace().collect();
+    assert_eq!(
+        parts[1], "4",
+        "expected 4 combined-whitelist cells, dims={dims}"
+    );
+    assert_eq!(matrix.lines().last().unwrap(), "1 1 1", "matrix:\n{matrix}");
+}
+
+// ---------------------------------------------------------------------------
 // Test 10 — CellRanger-style STARsolo run (Phase 14.5)
 //
 // Exercises the full CellRanger 4.x/5.x flag set from STARsolo.md:

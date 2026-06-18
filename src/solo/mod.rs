@@ -29,27 +29,75 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Fixed-position cell-barcode + UMI geometry for `CB_UMI_Simple`.
-///
-/// All offsets are stored 0-based (converted from STAR's 1-based
-/// `--soloCBstart` / `--soloUMIstart`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SoloBarcodeLayout {
-    /// 0-based start of the cell barcode in the barcode read.
-    pub cb_start: usize,
-    /// Cell-barcode length in bases.
-    pub cb_len: usize,
-    /// 0-based start of the UMI in the barcode read.
-    pub umi_start: usize,
-    /// UMI length in bases.
-    pub umi_len: usize,
+/// Cell-barcode + UMI read geometry. `Simple` is a single fixed-position CB +
+/// UMI (`CB_UMI_Simple`); `Complex` assembles the CB from several fixed-position
+/// segments (`CB_UMI_Complex`). All offsets are 0-based.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SoloBarcodeLayout {
+    Simple {
+        cb_start: usize,
+        cb_len: usize,
+        umi_start: usize,
+        umi_len: usize,
+    },
+    /// Multi-segment CB: each `(start, len)` is one segment, concatenated in
+    /// order to form the cell barcode; `umi = (start, len)`.
+    Complex {
+        cb_segments: Vec<(usize, usize)>,
+        umi: (usize, usize),
+    },
+}
+
+/// Parse a `--soloCBposition`/`--soloUMIposition` spec
+/// (`startAnchor_startDist_endAnchor_endDist`) into a 0-based `(start, len)`.
+/// Only read-start anchoring (`anchor = 0`) is supported.
+fn parse_position(spec: &str) -> Result<(usize, usize), Error> {
+    let f: Vec<&str> = spec.split('_').collect();
+    if f.len() != 4 {
+        return Err(invalid_pos(
+            spec,
+            "expected startAnchor_startDist_endAnchor_endDist",
+        ));
+    }
+    let (sa, sd, ea, ed) = (
+        f[0].parse::<i64>().ok(),
+        f[1].parse::<i64>().ok(),
+        f[2].parse::<i64>().ok(),
+        f[3].parse::<i64>().ok(),
+    );
+    match (sa, sd, ea, ed) {
+        (Some(0), Some(sd), Some(0), Some(ed)) if sd >= 0 && ed >= sd => {
+            Ok((sd as usize, (ed - sd + 1) as usize))
+        }
+        (Some(0), _, Some(0), _) => Err(invalid_pos(spec, "end < start")),
+        _ => Err(invalid_pos(
+            spec,
+            "only read-start anchoring (anchor=0) is supported",
+        )),
+    }
+}
+
+fn invalid_pos(spec: &str, why: &str) -> Error {
+    Error::from(std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!("invalid position spec '{spec}': {why}"),
+    ))
 }
 
 impl SoloBarcodeLayout {
-    /// Build the layout from CLI parameters, converting 1-based starts to
-    /// 0-based offsets.
+    /// Build the layout from CLI parameters. `CB_UMI_Complex` parses
+    /// `--soloCBposition`/`--soloUMIposition`; otherwise fixed Simple geometry.
     pub fn from_params(params: &Parameters) -> Self {
-        Self {
+        if params.solo_type == SoloType::CbUmiComplex && !params.solo_cb_position.is_empty() {
+            let cb_segments = params
+                .solo_cb_position
+                .iter()
+                .filter_map(|s| parse_position(s).ok())
+                .collect();
+            let umi = parse_position(&params.solo_umi_position).unwrap_or((0, 0));
+            return Self::Complex { cb_segments, umi };
+        }
+        Self::Simple {
             cb_start: (params.solo_cb_start.max(1) - 1) as usize,
             cb_len: params.solo_cb_len as usize,
             umi_start: (params.solo_umi_start.max(1) - 1) as usize,
@@ -57,32 +105,59 @@ impl SoloBarcodeLayout {
         }
     }
 
-    /// Minimum barcode-read length required to extract both CB and UMI.
+    /// Minimum barcode-read length required to extract the CB and UMI.
     pub fn min_read_len(&self) -> usize {
-        (self.cb_start + self.cb_len).max(self.umi_start + self.umi_len)
+        match self {
+            Self::Simple {
+                cb_start,
+                cb_len,
+                umi_start,
+                umi_len,
+            } => (cb_start + cb_len).max(umi_start + umi_len),
+            Self::Complex { cb_segments, umi } => cb_segments
+                .iter()
+                .map(|&(s, l)| s + l)
+                .chain(std::iter::once(umi.0 + umi.1))
+                .max()
+                .unwrap_or(0),
+        }
     }
 
-    /// Extract the CB and UMI from one barcode read. Returns `None` if the
-    /// read is shorter than [`Self::min_read_len`] (the read is then treated
-    /// as having no valid barcode).
+    /// Extract the CB (concatenating segments for `Complex`) and UMI from one
+    /// barcode read. `None` if the read is shorter than [`Self::min_read_len`].
     pub fn extract(&self, barcode_read: &EncodedRead) -> Option<CellBarcode> {
         let seq = &barcode_read.sequence;
         let qual = &barcode_read.quality;
         if seq.len() < self.min_read_len() {
             return None;
         }
-        let cb_seq = seq[self.cb_start..self.cb_start + self.cb_len].to_vec();
-        let umi_seq = seq[self.umi_start..self.umi_start + self.umi_len].to_vec();
-        // Quality vectors track the FASTQ length; guard in case quality is
-        // shorter than sequence (malformed record) by clamping.
-        let cb_qual = slice_or_empty(qual, self.cb_start, self.cb_len);
-        let umi_qual = slice_or_empty(qual, self.umi_start, self.umi_len);
-        Some(CellBarcode {
-            cb_seq,
-            cb_qual,
-            umi_seq,
-            umi_qual,
-        })
+        match self {
+            Self::Simple {
+                cb_start,
+                cb_len,
+                umi_start,
+                umi_len,
+            } => Some(CellBarcode {
+                cb_seq: seq[*cb_start..cb_start + cb_len].to_vec(),
+                cb_qual: slice_or_empty(qual, *cb_start, *cb_len),
+                umi_seq: seq[*umi_start..umi_start + umi_len].to_vec(),
+                umi_qual: slice_or_empty(qual, *umi_start, *umi_len),
+            }),
+            Self::Complex { cb_segments, umi } => {
+                let mut cb_seq = Vec::new();
+                let mut cb_qual = Vec::new();
+                for &(s, l) in cb_segments {
+                    cb_seq.extend_from_slice(&seq[s..s + l]);
+                    cb_qual.extend_from_slice(&slice_or_empty(qual, s, l));
+                }
+                Some(CellBarcode {
+                    cb_seq,
+                    cb_qual,
+                    umi_seq: seq[umi.0..umi.0 + umi.1].to_vec(),
+                    umi_qual: slice_or_empty(qual, umi.0, umi.1),
+                })
+            }
+        }
     }
 }
 
@@ -205,7 +280,10 @@ impl SoloReadReader {
 /// from `--readFilesIn`. Returns an error if solo is enabled but the read files
 /// are missing (validation should have caught this earlier).
 pub fn open_reader(params: &Parameters) -> Result<SoloReadReader, Error> {
-    debug_assert!(params.solo_type == SoloType::CbUmiSimple);
+    debug_assert!(matches!(
+        params.solo_type,
+        SoloType::CbUmiSimple | SoloType::CbUmiComplex
+    ));
     let cdna = params.cdna_read_file().ok_or_else(|| {
         Error::from(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -425,19 +503,35 @@ impl SoloContext {
     /// Build the solo context from parameters: load the whitelist and build the
     /// gene model from `--sjdbGTFfile`. Call once before alignment.
     pub fn build(params: &Parameters, genome: &crate::genome::Genome) -> Result<Self, Error> {
-        let whitelist = match params.solo_cb_whitelist_path() {
-            Some(path) => {
-                log::info!(
-                    "STARsolo: loading cell-barcode whitelist from {}",
-                    path.display()
-                );
-                let wl = CbWhitelist::load(&path)?;
-                log::info!("STARsolo: {} whitelist barcodes loaded", wl.len());
-                wl
+        let whitelist = if params.solo_type == SoloType::CbUmiComplex {
+            // One whitelist per CB segment → combined cartesian-product whitelist.
+            let paths: Vec<std::path::PathBuf> = params
+                .solo_cb_whitelist
+                .iter()
+                .map(std::path::PathBuf::from)
+                .collect();
+            log::info!(
+                "STARsolo CB_UMI_Complex: combining {} segment whitelists",
+                paths.len()
+            );
+            let wl = CbWhitelist::load_complex(&paths)?;
+            log::info!("STARsolo: {} combined whitelist barcodes", wl.len());
+            wl
+        } else {
+            match params.solo_cb_whitelist_path() {
+                Some(path) => {
+                    log::info!(
+                        "STARsolo: loading cell-barcode whitelist from {}",
+                        path.display()
+                    );
+                    let wl = CbWhitelist::load(&path)?;
+                    log::info!("STARsolo: {} whitelist barcodes loaded", wl.len());
+                    wl
+                }
+                None => CbWhitelist::NoWhitelist {
+                    len: params.solo_cb_len as usize,
+                },
             }
-            None => CbWhitelist::NoWhitelist {
-                len: params.solo_cb_len as usize,
-            },
         };
 
         // Gene model from the GTF (validated to be present for Gene/GeneFull).
@@ -663,7 +757,7 @@ mod tests {
 
     fn v2_layout() -> SoloBarcodeLayout {
         // 10x v2: CB at 1..16 (16 bp), UMI at 17..26 (10 bp).
-        SoloBarcodeLayout {
+        SoloBarcodeLayout::Simple {
             cb_start: 0,
             cb_len: 16,
             umi_start: 16,
@@ -687,11 +781,44 @@ mod tests {
         ])
         .unwrap();
         let layout = SoloBarcodeLayout::from_params(&params);
-        assert_eq!(layout.cb_start, 0);
-        assert_eq!(layout.cb_len, 16);
-        assert_eq!(layout.umi_start, 16);
-        assert_eq!(layout.umi_len, 10);
+        assert_eq!(
+            layout,
+            SoloBarcodeLayout::Simple {
+                cb_start: 0,
+                cb_len: 16,
+                umi_start: 16,
+                umi_len: 10,
+            }
+        );
         assert_eq!(layout.min_read_len(), 26);
+    }
+
+    #[test]
+    fn complex_layout_assembles_segments() {
+        // Two CB segments [0..2] + [4..6] (skipping a 2bp linker), UMI [6..8].
+        let layout = SoloBarcodeLayout::Complex {
+            cb_segments: vec![(0, 2), (4, 2)],
+            umi: (6, 2),
+        };
+        let read = encoded_read("r", "AACCGGTT", "IIIIIIII");
+        let bc = layout.extract(&read).unwrap();
+        // CB = bases [0,1] ++ [4,5] = "AA" ++ "GG"; UMI = [6,7] = "TT".
+        assert_eq!(
+            bc.cb_seq,
+            "AAGG".bytes().map(encode_base).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            bc.umi_seq,
+            "TT".bytes().map(encode_base).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn parse_position_read_start() {
+        assert_eq!(parse_position("0_0_0_7").unwrap(), (0, 8));
+        assert_eq!(parse_position("0_8_0_15").unwrap(), (8, 8));
+        assert!(parse_position("2_0_2_7").is_err()); // adapter anchor unsupported
+        assert!(parse_position("0_5_0_2").is_err()); // end < start
     }
 
     #[test]

@@ -282,6 +282,69 @@ impl CbWhitelist {
     /// Load a whitelist from a file (plain or gzip). One barcode per line;
     /// blank lines ignored. Barcodes are encoded, packed, sorted, de-duplicated.
     pub fn load(path: &Path) -> Result<Self, Error> {
+        let (packed, len) = Self::load_packed(path)?;
+        Ok(Self::from_packed_list(packed, len))
+    }
+
+    /// Build a `List` whitelist from packed barcodes (sort + dedup + index).
+    pub fn from_packed_list(packed: Vec<u64>, len: usize) -> Self {
+        let mut indexed: Vec<(u64, u32)> = packed
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (p, i as u32))
+            .collect();
+        indexed.sort_unstable_by_key(|&(p, _)| p);
+        indexed.dedup_by_key(|&mut (p, _)| p);
+        let sorted: Vec<u64> = indexed.iter().map(|&(p, _)| p).collect();
+        let orig_index: Vec<u32> = indexed.iter().map(|&(_, i)| i).collect();
+        let exact_counts = (0..sorted.len()).map(|_| AtomicU64::new(0)).collect();
+        Self::List {
+            sorted,
+            orig_index,
+            exact_counts,
+            len,
+        }
+    }
+
+    /// `CB_UMI_Complex`: combine per-segment whitelists into one whitelist of
+    /// concatenated barcodes (the cartesian product, segment order = file order).
+    /// Matching the assembled CB against this is equivalent to STARsolo's
+    /// per-segment matching for both Exact and 1MM (a 1MM in the concatenation is
+    /// a 1MM in exactly one segment). Errors if the combined length exceeds 32.
+    pub fn load_complex(paths: &[std::path::PathBuf]) -> Result<Self, Error> {
+        let segs: Vec<(Vec<u64>, usize)> = paths
+            .iter()
+            .map(|p| Self::load_packed(p))
+            .collect::<Result<_, _>>()?;
+        let total_len: usize = segs.iter().map(|(_, l)| l).sum();
+        if total_len == 0 || total_len > CB_LEN_MAX {
+            return Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("combined CB length {total_len} out of range (1..={CB_LEN_MAX})"),
+            )));
+        }
+        let n_combos: usize = segs.iter().map(|(p, _)| p.len()).product();
+        if n_combos > 100_000_000 {
+            return Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("CB_UMI_Complex whitelist product is {n_combos} barcodes (too large)"),
+            )));
+        }
+        let mut combined: Vec<u64> = vec![0];
+        for (packed, len) in &segs {
+            let mut next = Vec::with_capacity(combined.len() * packed.len());
+            for &c in &combined {
+                for &p in packed {
+                    next.push((c << (2 * len)) | p);
+                }
+            }
+            combined = next;
+        }
+        Ok(Self::from_packed_list(combined, total_len))
+    }
+
+    /// Read a whitelist file into raw packed barcodes + barcode length.
+    fn load_packed(path: &Path) -> Result<(Vec<u64>, usize), Error> {
         let reader = open_maybe_gzip(path)?;
         let mut packed: Vec<u64> = Vec::new();
         let mut len: usize = 0;
@@ -332,23 +395,7 @@ impl CbWhitelist {
                 "whitelist is empty",
             )));
         }
-        // Sort by packed value, carrying the original line index; de-duplicate.
-        let mut indexed: Vec<(u64, u32)> = packed
-            .into_iter()
-            .enumerate()
-            .map(|(i, p)| (p, i as u32))
-            .collect();
-        indexed.sort_unstable_by_key(|&(p, _)| p);
-        indexed.dedup_by_key(|&mut (p, _)| p);
-        let sorted: Vec<u64> = indexed.iter().map(|&(p, _)| p).collect();
-        let orig_index: Vec<u32> = indexed.iter().map(|&(_, i)| i).collect();
-        let exact_counts = (0..sorted.len()).map(|_| AtomicU64::new(0)).collect();
-        Ok(Self::List {
-            sorted,
-            orig_index,
-            exact_counts,
-            len,
-        })
+        Ok((packed, len))
     }
 
     /// Binary-search the sorted whitelist for `packed`; returns the sorted index.

@@ -755,6 +755,17 @@ pub struct Parameters {
     #[arg(long = "soloUMIlen", default_value_t = 10)]
     pub solo_umi_len: u32,
 
+    /// `CB_UMI_Complex` cell-barcode segment positions, one per segment, as
+    /// `startAnchor_startDist_endAnchor_endDist`. Only read-start anchoring
+    /// (`anchor = 0`, fixed positions) is supported, e.g. `0_0_0_7 0_8_0_15`.
+    #[arg(long = "soloCBposition", num_args = 0..)]
+    pub solo_cb_position: Vec<String>,
+
+    /// `CB_UMI_Complex` UMI position as `startAnchor_startDist_endAnchor_endDist`
+    /// (read-start anchoring only), e.g. `0_16_0_25`.
+    #[arg(long = "soloUMIposition", default_value = "")]
+    pub solo_umi_position: String,
+
     /// Genomic features to quantify per cell: Gene, GeneFull, SJ, Velocyto, …
     #[arg(long = "soloFeatures", num_args = 1.., default_values_t = vec!["Gene".to_string()])]
     pub solo_features: Vec<String>,
@@ -1071,6 +1082,25 @@ impl Parameters {
 
         // ── STARsolo validation ─────────────────────────────────────────
         if params.run_mode == RunMode::AlignReads && params.solo_enabled() {
+            // CB_UMI_Complex needs one CB position + whitelist per segment.
+            if params.solo_type == SoloType::CbUmiComplex {
+                if params.solo_cb_position.is_empty() {
+                    return Err(command.error(
+                        ErrorKind::MissingRequiredArgument,
+                        "--soloType CB_UMI_Complex requires --soloCBposition (one per CB segment)",
+                    ));
+                }
+                if params.solo_cb_whitelist.len() != params.solo_cb_position.len() {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--soloType CB_UMI_Complex: {} --soloCBposition segments but {} --soloCBwhitelist files (must match)",
+                            params.solo_cb_position.len(),
+                            params.solo_cb_whitelist.len()
+                        ),
+                    ));
+                }
+            }
             // SmartSeq is plate-based (one library per manifest cell, no barcodes).
             if params.solo_type == SoloType::SmartSeq && params.read_files_manifest.is_none() {
                 return Err(command.error(
