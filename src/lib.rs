@@ -415,7 +415,7 @@ fn run_smartseq(
     index: &std::sync::Arc<crate::index::GenomeIndex>,
     params: &Parameters,
 ) -> anyhow::Result<std::sync::Arc<crate::stats::AlignmentStats>> {
-    use crate::align::read_align::align_read;
+    use crate::align::read_align::{PairedAlignmentResult, align_paired_read, align_read};
     use crate::solo::{GeneAssignment, SoloStrand, classify_read};
     use rayon::prelude::*;
     use std::sync::Arc;
@@ -456,39 +456,106 @@ fn run_smartseq(
     let cell_ids: Vec<String> = cells.iter().map(|c| c.cell_id.clone()).collect();
     let counts = crate::solo::smartseq::SmartSeqCounts::new(cell_ids, gene_ann.gene_ids.len());
 
+    // Assign a (possibly multi-locus) read/fragment to a gene and count it.
+    let assign_count = |ci: usize, transcripts: &[crate::align::transcript::Transcript]| {
+        if let GeneAssignment::Gene(g) =
+            classify_read(transcripts, &gene_ann, strand, true, false, false).gene
+        {
+            counts.add(ci, g);
+        }
+    };
+    let cmd = params.read_files_command.as_deref();
+
     for (ci, cell) in cells.iter().enumerate() {
-        let mut reader =
-            crate::io::fastq::FastqReader::open(&cell.read1, params.read_files_command.as_deref())?;
-        loop {
-            let batch = reader.read_batch(10_000)?;
-            if batch.is_empty() {
-                break;
+        match &cell.read2 {
+            // Single-end: count reads.
+            None => {
+                let mut reader = crate::io::fastq::FastqReader::open(&cell.read1, cmd)?;
+                loop {
+                    let batch = reader.read_batch(10_000)?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    batch.par_iter().for_each(|read| {
+                        stats.record_read_bases(read.sequence.len() as u64);
+                        let Ok((transcripts, _chim, n_for_mapq, reason)) =
+                            align_read(&read.sequence, &read.name, index, params)
+                        else {
+                            return;
+                        };
+                        let n = if transcripts.is_empty() && n_for_mapq > 0 {
+                            n_for_mapq
+                        } else {
+                            transcripts.len()
+                        };
+                        stats.record_alignment(n, max_multimaps);
+                        if transcripts.is_empty() {
+                            stats.record_unmapped_reason(
+                                reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                            );
+                        } else if transcripts.len() == 1 {
+                            stats.record_transcript_stats(&transcripts[0]);
+                        }
+                        assign_count(ci, &transcripts);
+                    });
+                }
             }
-            batch.par_iter().for_each(|read| {
-                stats.record_read_bases(read.sequence.len() as u64);
-                let Ok((transcripts, _chim, n_for_mapq, reason)) =
-                    align_read(&read.sequence, &read.name, index, params)
-                else {
-                    return;
-                };
-                let n = if transcripts.is_empty() && n_for_mapq > 0 {
-                    n_for_mapq
-                } else {
-                    transcripts.len()
-                };
-                stats.record_alignment(n, max_multimaps);
-                if transcripts.is_empty() {
-                    stats.record_unmapped_reason(
-                        reason.unwrap_or(crate::stats::UnmappedReason::Other),
-                    );
-                } else if transcripts.len() == 1 {
-                    stats.record_transcript_stats(&transcripts[0]);
+            // Paired-end: align both mates as a fragment, count the fragment once
+            // (gene from the union of both mates' overlaps).
+            Some(r2) => {
+                let mut reader = crate::io::fastq::PairedFastqReader::open(&cell.read1, r2, cmd)?;
+                loop {
+                    let mut batch = Vec::with_capacity(10_000);
+                    while batch.len() < 10_000 {
+                        match reader.next_paired()? {
+                            Some(p) => batch.push(p),
+                            None => break,
+                        }
+                    }
+                    if batch.is_empty() {
+                        break;
+                    }
+                    batch.par_iter().for_each(|pr| {
+                        stats.record_read_bases(
+                            (pr.mate1.sequence.len() + pr.mate2.sequence.len()) as u64,
+                        );
+                        let Ok((results, _chim, n_for_mapq, reason)) = align_paired_read(
+                            &pr.mate1.sequence,
+                            &pr.mate2.sequence,
+                            &pr.name,
+                            index,
+                            params,
+                        ) else {
+                            return;
+                        };
+                        let n_pairs = results.len();
+                        let mut trs = Vec::with_capacity(n_pairs * 2);
+                        for r in results {
+                            match r {
+                                PairedAlignmentResult::BothMapped(pa) => {
+                                    trs.push(pa.mate1_transcript);
+                                    trs.push(pa.mate2_transcript);
+                                }
+                                PairedAlignmentResult::HalfMapped {
+                                    mapped_transcript, ..
+                                } => trs.push(mapped_transcript),
+                            }
+                        }
+                        let n = if trs.is_empty() && n_for_mapq > 0 {
+                            n_for_mapq
+                        } else {
+                            n_pairs
+                        };
+                        stats.record_alignment(n, max_multimaps);
+                        if trs.is_empty() {
+                            stats.record_unmapped_reason(
+                                reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                            );
+                        }
+                        assign_count(ci, &trs);
+                    });
                 }
-                let class = classify_read(&transcripts, &gene_ann, strand, true, false, false);
-                if let GeneAssignment::Gene(g) = class.gene {
-                    counts.add(ci, g);
-                }
-            });
+            }
         }
     }
 

@@ -7,8 +7,8 @@
 //! reads (no UMI deduplication). Output mirrors the droplet path:
 //! `Solo.out/Gene/raw/{matrix.mtx, barcodes.tsv (cell IDs), features.tsv}`.
 //!
-//! This MVP supports single-end manifests (`read2 = -`); paired-end SmartSeq is
-//! a follow-up.
+//! Supports both single-end manifests (`read2 = -`, read counts) and paired-end
+//! (`read2` = mate-2 file, fragment counts via paired alignment).
 
 use crate::error::Error;
 use std::path::{Path, PathBuf};
@@ -17,12 +17,14 @@ use std::sync::Mutex;
 /// One plate-well cell from the manifest.
 pub struct SmartSeqCell {
     pub read1: PathBuf,
+    /// Mate-2 file for paired-end SmartSeq; `None` for single-end (`read2 = -`).
+    pub read2: Option<PathBuf>,
     pub cell_id: String,
 }
 
 /// Parse a `--readFilesManifest` TSV into per-cell entries. Lines are
 /// `read1 <TAB> read2 <TAB> cellID`; blank lines and `#` comments are skipped.
-/// `read2` must be `-` (single-end only in this MVP).
+/// `read2 = -` is single-end; any other value is the mate-2 file (paired-end).
 pub fn parse_manifest(path: &Path) -> Result<Vec<SmartSeqCell>, Error> {
     let text = std::fs::read_to_string(path).map_err(|e| Error::io(e, path))?;
     let mut cells = Vec::new();
@@ -39,14 +41,9 @@ pub fn parse_manifest(path: &Path) -> Result<Vec<SmartSeqCell>, Error> {
                 line
             )));
         }
-        if f[1] != "-" {
-            return Err(invalid(format!(
-                "readFilesManifest line {}: paired-end SmartSeq (read2 != '-') is not yet supported",
-                lineno + 1
-            )));
-        }
         cells.push(SmartSeqCell {
             read1: PathBuf::from(f[0]),
+            read2: (f[1] != "-").then(|| PathBuf::from(f[1])),
             cell_id: f[2].to_string(),
         });
     }

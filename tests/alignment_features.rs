@@ -1292,6 +1292,79 @@ fn test_starsolo_smartseq() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9d-PE — STARsolo SmartSeq paired-end (fragment counts)
+//
+// One cell, 4 read pairs: mate1 in Exon1, mate2 in (reverse-complement) Exon2 →
+// a proper FR pair on gene G1. Each fragment is counted once (no UMI) → G1 = 4.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_smartseq_paired() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let r1_path = tmpdir.path().join("r1.fq");
+    let r2_path = tmpdir.path().join("r2.fq");
+    let mate1 = &genome[10000..10050]; // Exon1, forward
+    let mate2 = rc(&genome[10250..10300]); // Exon2, reverse-complement (FR mate)
+    {
+        let mut f1 = fs::File::create(&r1_path).unwrap();
+        let mut f2 = fs::File::create(&r2_path).unwrap();
+        for i in 0..4 {
+            writeln!(f1, "@p{i}").unwrap();
+            f1.write_all(mate1).unwrap();
+            writeln!(f1, "\n+\n{}", "I".repeat(50)).unwrap();
+            writeln!(f2, "@p{i}").unwrap();
+            f2.write_all(&mate2).unwrap();
+            writeln!(f2, "\n+\n{}", "I".repeat(50)).unwrap();
+        }
+    }
+    let manifest = tmpdir.path().join("manifest.tsv");
+    fs::write(
+        &manifest,
+        format!("{}\t{}\tCellPE\n", r1_path.display(), r2_path.display()),
+    )
+    .unwrap();
+
+    let output_dir = tmpdir.path().join("out_sspe");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--soloType",
+            "SmartSeq",
+            "--readFilesManifest",
+            manifest.to_str().unwrap(),
+            "--soloStrand",
+            "Unstranded",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let raw = output_dir.join("Solo.out").join("Gene").join("raw");
+    let matrix = fs::read_to_string(raw.join("matrix.mtx")).unwrap();
+    let dims = matrix.lines().find(|l| !l.starts_with('%')).unwrap();
+    // One gene (G1) × one cell; 4 fragments counted.
+    assert_eq!(dims, "1 1 1", "PE SmartSeq matrix dims:\n{matrix}");
+    assert_eq!(
+        matrix.lines().last().unwrap(),
+        "1 1 4",
+        "expected G1=4 fragments:\n{matrix}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 9e — STARsolo CB_UMI_Complex (multi-segment barcode)
 //
 // Barcode read layout: seg1(2bp) + linker(2bp) + seg2(2bp) + UMI(2bp). The cell
