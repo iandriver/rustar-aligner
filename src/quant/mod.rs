@@ -38,6 +38,11 @@ pub struct GeneAnnotation {
     /// (start, end). Used by the STARsolo `GeneFull` feature, which counts a
     /// read overlapping the gene locus including purely intronic reads.
     pub chr_gene_body: Vec<Vec<(u64, u64, usize)>>,
+    /// Per-gene merged, sorted exon intervals `[start, end)` (absolute coords),
+    /// indexed by `gene_idx`. Used by the `Velocyto` feature to tell whether an
+    /// aligned block lies wholly within an exon (mature/ambiguous) or extends
+    /// into an intron (nascent/unspliced).
+    pub gene_exons: Vec<Vec<(u64, u64)>>,
 }
 
 impl GeneAnnotation {
@@ -114,12 +119,47 @@ impl GeneAnnotation {
             bodies.sort_unstable_by_key(|&(s, e, _)| (s, e));
         }
 
+        // Per-gene merged exon intervals (for the Velocyto exonic/intronic test).
+        let mut gene_exons: Vec<Vec<(u64, u64)>> = vec![Vec::new(); gene_ids.len()];
+        for chr in &chr_exons {
+            for &(s, e, g) in chr {
+                gene_exons[g].push((s, e));
+            }
+        }
+        for ex in &mut gene_exons {
+            ex.sort_unstable();
+            // Merge overlapping/adjacent exons so a block test is unambiguous.
+            let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ex.len());
+            for &(s, e) in ex.iter() {
+                if let Some(last) = merged.last_mut()
+                    && s <= last.1
+                {
+                    last.1 = last.1.max(e);
+                } else {
+                    merged.push((s, e));
+                }
+            }
+            *ex = merged;
+        }
+
         GeneAnnotation {
             gene_ids,
             gene_is_reverse,
             chr_exons,
             chr_gene_body,
+            gene_exons,
         }
+    }
+
+    /// Whether the aligned block `[start, end)` lies wholly within a single
+    /// (merged) exon of gene `g` — i.e. it is exonic, not intron-spanning.
+    pub fn block_is_exonic(&self, g: usize, start: u64, end: u64) -> bool {
+        let Some(exons) = self.gene_exons.get(g) else {
+            return false;
+        };
+        // First exon with exon_start > start is at `i`; the candidate is `i-1`.
+        let i = exons.partition_point(|&(s, _)| s <= start);
+        i > 0 && exons[i - 1].0 <= start && end <= exons[i - 1].1
     }
 
     /// Build from GTF exon records using default `"gene_id"` attribute (backward-compatible).

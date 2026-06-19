@@ -95,6 +95,43 @@ fn strand_keeps(strand: SoloStrand, gene_is_reverse: bool, read_is_reverse: bool
     }
 }
 
+/// RNA-velocity read category (Sullivan et al. 2025 mature/nascent/ambiguous,
+/// reported as scVelo's spliced/unspliced/ambiguous).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VelocytoCategory {
+    /// Spans an exon–exon junction → processed (mature) mRNA.
+    Spliced,
+    /// No junction, but a block extends into an intron → nascent mRNA.
+    Unspliced,
+    /// No junction, all blocks wholly within exons → origin indistinguishable.
+    Ambiguous,
+}
+
+/// Classify a uniquely-mapped read (assigned to gene `g` by gene-body overlap)
+/// into its velocity category from the alignment: a splice in the CIGAR means
+/// the read is mature; otherwise an aligned block that leaves the exons (into an
+/// intron) means nascent; a wholly-exonic block is ambiguous.
+pub fn velocyto_category(
+    transcripts: &[Transcript],
+    gene_ann: &GeneAnnotation,
+    g: u32,
+) -> VelocytoCategory {
+    if transcripts.iter().any(|t| t.n_junction > 0) {
+        return VelocytoCategory::Spliced;
+    }
+    let g = g as usize;
+    let all_exonic = transcripts.iter().all(|t| {
+        t.exons
+            .iter()
+            .all(|e| gene_ann.block_is_exonic(g, e.genome_start, e.genome_end))
+    });
+    if all_exonic {
+        VelocytoCategory::Ambiguous
+    } else {
+        VelocytoCategory::Unspliced
+    }
+}
+
 /// CellRanger-style positional region of a uniquely-mapped read (independent of
 /// strand): which genomic region the read falls in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

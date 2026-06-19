@@ -15,7 +15,10 @@ pub mod smartseq;
 pub mod whitelist;
 
 pub use count::{UmiDedup, UmiFiltering, write_gene_matrix};
-pub use gene::{GeneAssignment, Region, SoloFeature, SoloStrand, assign_gene_se, classify_read};
+pub use gene::{
+    GeneAssignment, Region, SoloFeature, SoloStrand, VelocytoCategory, assign_gene_se,
+    classify_read, velocyto_category,
+};
 pub use whitelist::{
     CbCandidate, CbMatch, CbMatchStats, CbMatchType, CbWhitelist, UmiCheck, check_umi, pack_barcode,
 };
@@ -382,6 +385,16 @@ pub struct SjCountRecord {
     pub intron_end: u64,
 }
 
+/// One (cell, UMI, gene) observation for the `Velocyto` feature, tagged with the
+/// read's spliced/unspliced/ambiguous category.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VelocytoRecord {
+    pub cb: u32,
+    pub umi: u64,
+    pub gene: u32,
+    pub category: VelocytoCategory,
+}
+
 /// A read whose cell barcode matched multiple whitelist entries by 1MM
 /// (`1MM_multi`). Resolution to a single CB needs the global exact-count table
 /// and is deferred to the collation stage (Phase 14.4).
@@ -463,6 +476,10 @@ pub struct SoloContext {
     pub sj_enabled: bool,
     /// (cell, UMI, junction) observations for the SJ feature.
     pub sj_records: Mutex<Vec<SjCountRecord>>,
+    /// `--soloFeatures Velocyto`: collect spliced/unspliced/ambiguous counts.
+    pub velocyto_enabled: bool,
+    /// (cell, UMI, gene, category) observations for the Velocyto feature.
+    pub velocyto_records: Mutex<Vec<VelocytoRecord>>,
     /// `--soloMultiMappers` includes a non-`Unique` method → capture gene-
     /// ambiguous reads for distribution into `UniqueAndMult-*.mtx`.
     pub want_multi: bool,
@@ -486,6 +503,8 @@ pub struct SoloReadOutcome {
     /// SJ-feature records for this read (one per crossed junction); empty unless
     /// `--soloFeatures SJ` and the read is uniquely mapped with a resolved CB.
     pub sj: Vec<SjCountRecord>,
+    /// Velocyto record for this read (resolved CB, gene-assigned), if enabled.
+    pub velocyto: Option<VelocytoRecord>,
 }
 
 /// The record(s) one read produces for a single feature.
@@ -576,6 +595,7 @@ impl SoloContext {
         let recorders = features.iter().map(|_| SoloRecorder::new()).collect();
         let feature_reads = features.iter().map(|_| AtomicU64::new(0)).collect();
         let sj_enabled = params.solo_features.iter().any(|f| f == "SJ");
+        let velocyto_enabled = params.solo_features.iter().any(|f| f == "Velocyto");
         let want_multi = params.solo_multi_mappers.iter().any(|m| m != "Unique");
 
         Ok(Self {
@@ -591,6 +611,8 @@ impl SoloContext {
             region_stats: RegionStats::default(),
             sj_enabled,
             sj_records: Mutex::new(Vec::new()),
+            velocyto_enabled,
+            velocyto_records: Mutex::new(Vec::new()),
             want_multi,
         })
     }
@@ -610,7 +632,8 @@ impl SoloContext {
         // per-feature gene assignment and the CellRanger-style mapping funnel, so
         // this is no more work than the old per-feature `assign_gene_se` calls.
         let want_exon = self.features.contains(&SoloFeature::Gene);
-        let want_body = self.features.contains(&SoloFeature::GeneFull);
+        // Velocyto assigns its gene by gene-body overlap, so it needs `want_body`.
+        let want_body = self.features.contains(&SoloFeature::GeneFull) || self.velocyto_enabled;
         let class = classify_read(
             cdna_transcripts,
             &self.gene_ann,
@@ -685,6 +708,20 @@ impl SoloContext {
                     intron_end,
                 })
                 .collect();
+        }
+
+        // Velocyto feature: gene from gene-body overlap, then classify the read
+        // spliced/unspliced/ambiguous. Resolved CB only.
+        if self.velocyto_enabled
+            && let Some(cb) = cb_resolved
+            && let GeneAssignment::Gene(gene) = class.gene_full
+        {
+            out.velocyto = Some(VelocytoRecord {
+                cb,
+                umi,
+                gene,
+                category: velocyto_category(cdna_transcripts, &self.gene_ann, gene),
+            });
         }
 
         // The CB match + UMI are shared across features; reuse the cached

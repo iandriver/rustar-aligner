@@ -1123,12 +1123,16 @@ impl Parameters {
                     ),
                 ));
             }
-            // Gene / GeneFull / SJ are implemented (Velocyto, … are not yet).
+            // Gene / GeneFull / SJ / Velocyto are implemented.
             for f in &params.solo_features {
-                if f != "SJ" && f.parse::<crate::solo::SoloFeature>().is_err() {
+                if !matches!(f.as_str(), "SJ" | "Velocyto")
+                    && f.parse::<crate::solo::SoloFeature>().is_err()
+                {
                     return Err(command.error(
                         ErrorKind::InvalidValue,
-                        format!("unsupported --soloFeatures '{f}'; supported: Gene, GeneFull, SJ"),
+                        format!(
+                            "unsupported --soloFeatures '{f}'; supported: Gene, GeneFull, SJ, Velocyto"
+                        ),
                     ));
                 }
             }
@@ -1151,7 +1155,7 @@ impl Parameters {
             let needs_gtf = params
                 .solo_features
                 .iter()
-                .any(|f| f == "Gene" || f == "GeneFull");
+                .any(|f| f == "Gene" || f == "GeneFull" || f == "Velocyto");
             if needs_gtf && params.sjdb_gtf_file.is_none() {
                 return Err(command.error(
                     ErrorKind::MissingRequiredArgument,

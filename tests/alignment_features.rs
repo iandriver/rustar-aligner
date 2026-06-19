@@ -1365,6 +1365,94 @@ fn test_starsolo_smartseq_paired() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9f — STARsolo Velocyto (spliced / unspliced / ambiguous)
+//
+// Three reads on gene G1, one per category: a junction-spanning read (spliced),
+// a purely intronic read (unspliced), and a wholly-exonic read with no junction
+// (ambiguous, per Sullivan 2025). Distinct UMIs → one molecule in each matrix.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_velocyto() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let bc_path = tmpdir.path().join("bc.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    // category → cDNA read + a distinct (non-homopolymer) 12 bp UMI.
+    let mut spliced = genome[10025..10050].to_vec(); // Exon1 end ...
+    spliced.extend_from_slice(&genome[10250..10275]); // ... + Exon2 start → junction
+    let reads: [(Vec<u8>, &str); 3] = [
+        (spliced, "ACGTACGTACGT"),                       // spliced
+        (genome[10100..10150].to_vec(), "TGCATGCATGCA"), // intronic → unspliced
+        (genome[10000..10050].to_vec(), "GATCGATCGATC"), // exonic, no junction → ambiguous
+    ];
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&bc_path).unwrap();
+        for (i, (seq, umi)) in reads.iter().enumerate() {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(seq).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(seq.len())).unwrap();
+            writeln!(bf, "@r{i}\n{cb}{umi}\n+\n{}", "I".repeat(28)).unwrap();
+        }
+        fs::write(&wl_path, format!("{cb}\nCCCCGGGGTTTTAAAA\n")).unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_velo");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            bc_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloFeatures",
+            "Velocyto",
+            "--soloStrand",
+            "Forward",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let raw = output_dir.join("Solo.out").join("Velocyto").join("raw");
+    // Each category matrix holds exactly its one molecule for G1 (row 1, col 1).
+    for name in ["spliced", "unspliced", "ambiguous"] {
+        let m = fs::read_to_string(raw.join(format!("{name}.mtx"))).unwrap();
+        assert_eq!(
+            m.lines().last().unwrap(),
+            "1 1 1",
+            "{name}.mtx should have G1=1:\n{m}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Test 9e — STARsolo CB_UMI_Complex (multi-segment barcode)
 //
 // Barcode read layout: seg1(2bp) + linker(2bp) + seg2(2bp) + UMI(2bp). The cell

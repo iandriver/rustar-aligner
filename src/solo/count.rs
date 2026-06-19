@@ -1268,6 +1268,35 @@ pub fn write_gene_matrix(
             nnz,
         );
     }
+
+    // Velocyto feature: spliced / unspliced / ambiguous gene×cell matrices.
+    if ctx.velocyto_enabled {
+        let velo_dir = params.output_path(&format!("{solo_dir}Velocyto/raw/"));
+        std::fs::create_dir_all(&velo_dir).map_err(|e| Error::io(e, &velo_dir))?;
+        write_features(&velo_dir.join(&features_name), &ctx.gene_ann.gene_ids, gzip)?;
+        write_barcodes(
+            &velo_dir.join(&barcodes_name),
+            &ctx.whitelist,
+            sorted.len(),
+            gzip,
+        )?;
+        let umi_len = params.solo_umi_len as usize;
+        let nnz = build_velocyto_matrices(
+            &ctx.velocyto_records.lock().unwrap(),
+            method,
+            umi_len,
+            &velo_dir,
+            n_genes,
+            sorted.len(),
+            gzip,
+        )?;
+        log::info!(
+            "STARsolo: wrote Velocyto/raw matrices (spliced={} unspliced={} ambiguous={} entries)",
+            nnz[0],
+            nnz[1],
+            nnz[2],
+        );
+    }
     Ok(())
 }
 
@@ -1334,6 +1363,111 @@ fn build_sj_matrix(
         std::io::copy(&mut r, w).map_err(|e| Error::io(e, matrix_path))?;
         Ok(())
     })?;
+    Ok(nnz)
+}
+
+/// Build the three `Velocyto` matrices (`spliced`/`unspliced`/`ambiguous`) from
+/// (cell, UMI, gene, category) records. Per (cell, gene) each UMI is resolved to
+/// one category (priority unspliced > spliced > ambiguous — any intron evidence
+/// makes the molecule nascent), then UMI-deduplicated per category. Genes are
+/// rows, cells columns — same layout as the Gene matrix, written as three files
+/// scVelo/dynamo ingest directly.
+#[allow(clippy::too_many_arguments)]
+fn build_velocyto_matrices(
+    records: &[crate::solo::VelocytoRecord],
+    method: UmiDedup,
+    umi_len: usize,
+    dir: &Path,
+    n_genes: usize,
+    n_barcodes: usize,
+    gzip: bool,
+) -> Result<[usize; 3], Error> {
+    use crate::solo::VelocytoCategory;
+    // Category → matrix index (file order) and resolution priority.
+    let cat_idx = |c: VelocytoCategory| match c {
+        VelocytoCategory::Spliced => 0usize,
+        VelocytoCategory::Unspliced => 1,
+        VelocytoCategory::Ambiguous => 2,
+    };
+    let priority = |c: VelocytoCategory| match c {
+        VelocytoCategory::Unspliced => 2u8,
+        VelocytoCategory::Spliced => 1,
+        VelocytoCategory::Ambiguous => 0,
+    };
+    let names = ["spliced.mtx", "unspliced.mtx", "ambiguous.mtx"];
+
+    let mut recs: Vec<&crate::solo::VelocytoRecord> = records.iter().collect();
+    recs.sort_unstable_by_key(|r| r.cb);
+
+    let mut bodies: Vec<tempfile::NamedTempFile> = Vec::new();
+    for _ in 0..3 {
+        bodies.push(
+            tempfile::Builder::new()
+                .prefix(".velo_body")
+                .tempfile_in(dir)
+                .map_err(|e| Error::io(e, dir))?,
+        );
+    }
+    let mut nnz = [0usize; 3];
+    {
+        let mut writers: Vec<std::io::BufWriter<&mut std::fs::File>> = bodies
+            .iter_mut()
+            .map(|t| std::io::BufWriter::new(t.as_file_mut()))
+            .collect();
+        let mut i = 0;
+        while i < recs.len() {
+            let cb = recs[i].cb;
+            // gene → umi → (resolved category, read count)
+            let mut gene_umi: HashMap<u32, HashMap<u64, (VelocytoCategory, u32)>> = HashMap::new();
+            while i < recs.len() && recs[i].cb == cb {
+                let r = recs[i];
+                let e = gene_umi
+                    .entry(r.gene)
+                    .or_default()
+                    .entry(r.umi)
+                    .or_insert((r.category, 0));
+                e.1 += 1;
+                if priority(r.category) > priority(e.0) {
+                    e.0 = r.category;
+                }
+                i += 1;
+            }
+            // Per gene, dedup UMIs within each resolved category, emit entries.
+            let mut genes: Vec<&u32> = gene_umi.keys().collect();
+            genes.sort_unstable();
+            for &g in &genes {
+                let umis = &gene_umi[g];
+                let mut by_cat: [HashMap<u64, u32>; 3] =
+                    [HashMap::new(), HashMap::new(), HashMap::new()];
+                for (&umi, &(cat, rc)) in umis {
+                    by_cat[cat_idx(cat)].insert(umi, rc);
+                }
+                for (k, w) in writers.iter_mut().enumerate() {
+                    let c = dedup_count(&by_cat[k], method, umi_len);
+                    if c > 0 {
+                        writeln!(w, "{} {} {}", g + 1, cb + 1, c).map_err(|e| Error::io(e, dir))?;
+                        nnz[k] += 1;
+                    }
+                }
+            }
+        }
+        for w in &mut writers {
+            w.flush().map_err(|e| Error::io(e, dir))?;
+        }
+    }
+
+    for (k, body) in bodies.iter().enumerate() {
+        let path = dir.join(names[k]);
+        write_file(&path, gzip, |w| {
+            writeln!(w, "%%MatrixMarket matrix coordinate integer general")
+                .map_err(|e| Error::io(e, &path))?;
+            writeln!(w, "%").map_err(|e| Error::io(e, &path))?;
+            writeln!(w, "{n_genes} {n_barcodes} {}", nnz[k]).map_err(|e| Error::io(e, &path))?;
+            let mut r = std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?;
+            std::io::copy(&mut r, w).map_err(|e| Error::io(e, &path))?;
+            Ok(())
+        })?;
+    }
     Ok(nnz)
 }
 

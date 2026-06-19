@@ -1649,6 +1649,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
         sam_records: BufferedSamRecords,
         per_feature: Vec<crate::solo::FeatureOutcome>,
         sj: Vec<crate::solo::SjCountRecord>,
+        velocyto: Option<crate::solo::VelocytoRecord>,
     }
 
     info!("STARsolo: aligning cDNA reads and quantifying barcodes...");
@@ -1693,6 +1694,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                         sam_records: buffer,
                         per_feature: outcome.per_feature,
                         sj: outcome.sj,
+                        velocyto: outcome.velocyto,
                     });
                 }
 
@@ -1767,6 +1769,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                     sam_records: buffer,
                     per_feature: outcome.per_feature,
                     sj: outcome.sj,
+                    velocyto: outcome.velocyto,
                 })
             })
             .collect();
@@ -1778,6 +1781,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
         let mut feat_multi_gene: Vec<Vec<crate::solo::MultiGeneRecord>> =
             (0..n_feat).map(|_| Vec::new()).collect();
         let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
+        let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
         for result in batch_results {
             let product = result?;
             writer.write_batch(&product.sam_records.records)?;
@@ -1793,6 +1797,7 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
                 }
             }
             sj_batch.extend(product.sj);
+            velo_batch.extend(product.velocyto);
         }
         for (fi, recorder) in solo.recorders.iter().enumerate() {
             recorder.extend(
@@ -1806,6 +1811,9 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
         }
         if !sj_batch.is_empty() {
             solo.sj_records.lock().unwrap().extend(sj_batch);
+        }
+        if !velo_batch.is_empty() {
+            solo.velocyto_records.lock().unwrap().extend(velo_batch);
         }
 
         read_count += reads_to_process as u64;
