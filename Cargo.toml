@@ -59,6 +59,8 @@ caps-sa = "0.6"
 # extra cost in release, but the default features add a few hundred
 # kB of fast-path stubs we don't need).
 mimalloc = { version = "0.1", default-features = false }
+libdeflater = "1.25.2"
+noodles-bgzf = { version = "0.47", features = ["libdeflate"] }
 
 [dev-dependencies]
 assert_cmd = "2"

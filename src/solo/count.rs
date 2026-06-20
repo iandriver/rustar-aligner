@@ -12,8 +12,6 @@
 use crate::error::Error;
 use crate::solo::whitelist::CbWhitelist;
 use crate::solo::{SoloContext, SoloCountRecord};
-use flate2::Compression;
-use flate2::write::GzEncoder;
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
@@ -35,9 +33,25 @@ where
     };
     let file = std::fs::File::create(&final_path).map_err(|e| Error::io(e, &final_path))?;
     if gzip {
-        let mut enc = GzEncoder::new(file, Compression::default());
-        body(&mut enc)?;
-        enc.finish().map_err(|e| Error::io(e, &final_path))?;
+        // libdeflate compresses a whole buffer at once (no streaming API), so the
+        // body is collected then gzip-compressed in one shot — markedly faster
+        // than streaming flate2 at the same ratio. Matrix/barcode bodies are tens
+        // of MB, which fits comfortably in memory.
+        let mut buf: Vec<u8> = Vec::new();
+        body(&mut buf)?;
+        let lvl = libdeflater::CompressionLvl::new(6).unwrap_or_default();
+        let mut comp = libdeflater::Compressor::new(lvl);
+        let mut out = vec![0u8; comp.gzip_compress_bound(buf.len())];
+        let n = comp.gzip_compress(&buf, &mut out).map_err(|e| {
+            Error::io(
+                std::io::Error::other(format!("libdeflate gzip: {e:?}")),
+                &final_path,
+            )
+        })?;
+        let mut w = std::io::BufWriter::new(file);
+        w.write_all(&out[..n])
+            .map_err(|e| Error::io(e, &final_path))?;
+        w.flush().map_err(|e| Error::io(e, &final_path))?;
     } else {
         let mut w = std::io::BufWriter::new(file);
         body(&mut w)?;
