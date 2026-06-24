@@ -1453,6 +1453,177 @@ fn test_starsolo_velocyto() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9f — Velocyto fold mode (`--soloVelocytoAmbiguous no`): exon-only
+// molecules are folded into spliced and no `ambiguous.mtx` is written
+// (cf. He, Soneson & Patro 2023). Same fixture as Test 9 but the exon-only
+// molecule (distinct UMI) lands in spliced, giving G1 = 2 there.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_velocyto_fold_ambiguous() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let bc_path = tmpdir.path().join("bc.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    let mut spliced = genome[10025..10050].to_vec();
+    spliced.extend_from_slice(&genome[10250..10275]);
+    let reads: [(Vec<u8>, &str); 3] = [
+        (spliced, "ACGTACGTACGT"),                       // spliced
+        (genome[10100..10150].to_vec(), "TGCATGCATGCA"), // intronic → unspliced
+        (genome[10000..10050].to_vec(), "GATCGATCGATC"), // exonic, no junction → ambiguous
+    ];
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&bc_path).unwrap();
+        for (i, (seq, umi)) in reads.iter().enumerate() {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(seq).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(seq.len())).unwrap();
+            writeln!(bf, "@r{i}\n{cb}{umi}\n+\n{}", "I".repeat(28)).unwrap();
+        }
+        fs::write(&wl_path, format!("{cb}\nCCCCGGGGTTTTAAAA\n")).unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_velo_fold");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            bc_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloFeatures",
+            "Velocyto",
+            "--soloVelocytoAmbiguous",
+            "no",
+            "--soloStrand",
+            "Forward",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let raw = output_dir.join("Solo.out").join("Velocyto").join("raw");
+    assert!(
+        !raw.join("ambiguous.mtx").exists(),
+        "ambiguous.mtx must not be written in fold mode"
+    );
+    let unspliced = fs::read_to_string(raw.join("unspliced.mtx")).unwrap();
+    assert_eq!(
+        unspliced.lines().last().unwrap(),
+        "1 1 1",
+        "unspliced unchanged by folding:\n{unspliced}"
+    );
+    let spliced_m = fs::read_to_string(raw.join("spliced.mtx")).unwrap();
+    assert_eq!(
+        spliced_m.lines().last().unwrap(),
+        "1 1 2",
+        "spliced should gain the folded exon-only molecule:\n{spliced_m}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Test 9g — regression guard for the solo reader pipeline: a run that stops
+// early via `--readMapNumber` must terminate. The background FASTQ-decode
+// thread feeds a bounded (depth-2) channel; on an early break the consumer
+// must disconnect so a producer blocked on the full channel wakes, instead of
+// deadlocking the scope join. Needs > 2 batches (batch size 10k) of input to
+// actually fill the channel after the break — hence 30k reads.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_readmapnumber_terminates() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let bc_path = tmpdir.path().join("bc.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    let exon = &genome[10000..10050];
+    let qual = "I".repeat(exon.len());
+    {
+        let mut cf = std::io::BufWriter::new(fs::File::create(&cdna_path).unwrap());
+        let mut bf = std::io::BufWriter::new(fs::File::create(&bc_path).unwrap());
+        for i in 0..30_000 {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(exon).unwrap();
+            writeln!(cf, "\n+\n{qual}").unwrap();
+            writeln!(bf, "@r{i}\n{cb}ACGTACGTACGT\n+\n{}", "I".repeat(28)).unwrap();
+        }
+        fs::write(&wl_path, format!("{cb}\n")).unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_rmn");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    // readMapNumber (3) far below the 30k input: the consumer breaks after the
+    // first batch while the producer still has batches to send. Must finish.
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            bc_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloFeatures",
+            "Gene",
+            "--soloStrand",
+            "Forward",
+            "--readMapNumber",
+            "3",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+}
+
+// ---------------------------------------------------------------------------
 // Test 9e — STARsolo CB_UMI_Complex (multi-segment barcode)
 //
 // Barcode read layout: seg1(2bp) + linker(2bp) + seg2(2bp) + UMI(2bp). The cell

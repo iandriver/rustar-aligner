@@ -1353,6 +1353,12 @@ pub fn write_gene_matrix(
             gzip,
         )?;
         let umi_len = params.solo_umi_len as usize;
+        // `--soloVelocytoAmbiguous no` folds exon-only molecules into spliced and
+        // omits ambiguous.mtx (rustar extension); default `yes` = STARsolo 3-matrix.
+        let keep_ambiguous = !matches!(
+            params.solo_velocyto_ambiguous.as_str(),
+            "no" | "No" | "false"
+        );
         let nnz = build_velocyto_matrices(
             &ctx.velocyto_records.lock().unwrap(),
             method,
@@ -1361,13 +1367,22 @@ pub fn write_gene_matrix(
             n_genes,
             sorted.len(),
             gzip,
+            keep_ambiguous,
         )?;
-        log::info!(
-            "STARsolo: wrote Velocyto/raw matrices (spliced={} unspliced={} ambiguous={} entries)",
-            nnz[0],
-            nnz[1],
-            nnz[2],
-        );
+        if keep_ambiguous {
+            log::info!(
+                "STARsolo: wrote Velocyto/raw matrices (spliced={} unspliced={} ambiguous={} entries)",
+                nnz[0],
+                nnz[1],
+                nnz[2],
+            );
+        } else {
+            log::info!(
+                "STARsolo: wrote Velocyto/raw matrices, ambiguous folded into spliced (spliced={} unspliced={} entries)",
+                nnz[0],
+                nnz[1],
+            );
+        }
     }
     Ok(())
 }
@@ -1439,12 +1454,18 @@ fn build_sj_matrix(
     Ok(nnz)
 }
 
-/// Build the three `Velocyto` matrices (`spliced`/`unspliced`/`ambiguous`) from
-/// (cell, UMI, gene, category) records. Per (cell, gene) each UMI is resolved to
-/// one category (priority unspliced > spliced > ambiguous — any intron evidence
-/// makes the molecule nascent), then UMI-deduplicated per category. Genes are
-/// rows, cells columns — same layout as the Gene matrix, written as three files
-/// scVelo/dynamo ingest directly.
+/// Build the `Velocyto` matrices from (cell, UMI, gene, category) records. Per
+/// (cell, gene) each UMI is resolved to one category (priority unspliced over
+/// spliced over ambiguous — any intron evidence makes the molecule nascent), then
+/// UMI-deduplicated per category. Genes are rows, cells columns — same layout as
+/// the Gene matrix, written as files scVelo/dynamo ingest directly.
+///
+/// With `keep_ambiguous` (default, STARsolo-faithful) three matrices are written:
+/// `spliced`/`unspliced`/`ambiguous`. With `keep_ambiguous = false` the exon-only
+/// `ambiguous` molecules are folded into `spliced` (an exon-only read is most
+/// likely mature mRNA; cf. He, Soneson & Patro 2023) and only `spliced`/`unspliced`
+/// are written — no `ambiguous.mtx`. The returned `[usize; 3]` always reports
+/// `[spliced, unspliced, ambiguous]` nnz (ambiguous is 0 when folded).
 #[allow(clippy::too_many_arguments)]
 fn build_velocyto_matrices(
     records: &[crate::solo::VelocytoRecord],
@@ -1454,6 +1475,7 @@ fn build_velocyto_matrices(
     n_genes: usize,
     n_barcodes: usize,
     gzip: bool,
+    keep_ambiguous: bool,
 ) -> Result<[usize; 3], Error> {
     use crate::solo::VelocytoCategory;
     // Category → matrix index (file order) and resolution priority.
@@ -1519,6 +1541,12 @@ fn build_velocyto_matrices(
                 for (&umi, &(cat, rc)) in umis {
                     by_cat[cat_idx(cat)].insert(umi, rc);
                 }
+                // Fold ambiguous (exon-only) molecules into spliced. A UMI resolves
+                // to exactly one category, so spliced/ambiguous keys are disjoint.
+                if !keep_ambiguous {
+                    let amb = std::mem::take(&mut by_cat[2]);
+                    by_cat[0].extend(amb);
+                }
                 for (k, buf) in bufs.iter_mut().enumerate() {
                     let c = dedup_count(&by_cat[k], method, umi_len);
                     if c > 0 {
@@ -1557,7 +1585,9 @@ fn build_velocyto_matrices(
         }
     }
 
-    for (k, body) in bodies.iter().enumerate() {
+    // Three files by default; only spliced/unspliced when ambiguous is folded.
+    let n_out = if keep_ambiguous { 3 } else { 2 };
+    for (k, body) in bodies.iter().take(n_out).enumerate() {
         let path = dir.join(names[k]);
         write_file(&path, gzip, |w| {
             writeln!(w, "%%MatrixMarket matrix coordinate integer general")

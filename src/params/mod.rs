@@ -800,6 +800,15 @@ pub struct Parameters {
     #[arg(long = "soloOutGzip", default_value = "no")]
     pub solo_out_gzip: String,
 
+    /// Velocyto ambiguous-molecule handling (rustar extension beyond STARsolo).
+    /// `yes` (default) writes the three `spliced`/`unspliced`/`ambiguous` matrices
+    /// like STARsolo — exon-only molecules with no junction/intron evidence stay in
+    /// `ambiguous`. `no` resolves those molecules to `spliced` (an exon-only read is
+    /// most likely mature mRNA; cf. He, Soneson & Patro 2023) and writes only
+    /// `spliced`/`unspliced`, with no `ambiguous.mtx`.
+    #[arg(long = "soloVelocytoAmbiguous", default_value = "yes")]
+    pub solo_velocyto_ambiguous: String,
+
     /// Strand of the read relative to the gene for counting: Forward, Reverse, Unstranded.
     #[arg(long = "soloStrand", default_value = "Forward")]
     pub solo_strand: String,

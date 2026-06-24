@@ -1658,9 +1658,9 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
     // section that otherwise stalls every rayon worker) with the parallel work.
     // A bounded channel (depth 2) supplies backpressure so the reader stays at
     // most one batch ahead.
-    let (tx, rx) =
-        std::sync::mpsc::sync_channel::<Result<Vec<crate::solo::SoloRead>, error::Error>>(2);
     std::thread::scope(|scope| -> anyhow::Result<()> {
+        let (tx, rx) =
+            std::sync::mpsc::sync_channel::<Result<Vec<crate::solo::SoloRead>, error::Error>>(2);
         scope.spawn(move || {
             let mut reader = reader;
             loop {
@@ -1679,181 +1679,194 @@ fn align_reads_solo<W: AlignmentWriter + ?Sized>(
             }
         });
 
-        for msg in &rx {
-            let batch = msg?;
-            if batch.is_empty() {
-                break;
-            }
-            let reads_to_process = if read_count + batch.len() as u64 > max_reads {
-                (max_reads - read_count) as usize
-            } else {
-                batch.len()
-            };
-            let batch_to_process = &batch[..reads_to_process];
+        // Run the consumer in an IIFE so that on ANY exit path (EOF, a
+        // `--readMapNumber` early break, or a `?` error) we still reach the
+        // `drop(rx)` below. Disconnecting the receiver wakes a producer that is
+        // blocked on the full bounded channel (its `send` returns Err, so it
+        // breaks) — otherwise an early exit would deadlock joining the scope.
+        let result = (|| -> anyhow::Result<()> {
+            for msg in &rx {
+                let batch = msg?;
+                if batch.is_empty() {
+                    break;
+                }
+                let reads_to_process = if read_count + batch.len() as u64 > max_reads {
+                    (max_reads - read_count) as usize
+                } else {
+                    batch.len()
+                };
+                let batch_to_process = &batch[..reads_to_process];
 
-            let batch_results: Vec<Result<SoloReadProduct, error::Error>> = batch_to_process
-                .par_iter()
-                .map(|sread| {
-                    let index = Arc::clone(index);
-                    let stats = Arc::clone(&stats);
-                    let sj_stats = Arc::clone(&sj_stats);
-                    let solo = Arc::clone(&solo);
+                let batch_results: Vec<Result<SoloReadProduct, error::Error>> = batch_to_process
+                    .par_iter()
+                    .map(|sread| {
+                        let index = Arc::clone(index);
+                        let stats = Arc::clone(&stats);
+                        let sj_stats = Arc::clone(&sj_stats);
+                        let solo = Arc::clone(&solo);
 
-                    let read = &sread.cdna;
-                    // CellRanger4 adapter clipping (TSO 5' + polyA 3') runs before
-                    // the fixed clip5p/clip3p Nbases trimming.
-                    let (cr_seq, cr_qual) = if cr4_clip {
-                        crate::solo::clip_adapter_cr4(&read.sequence, &read.quality)
-                    } else {
-                        (read.sequence.clone(), read.quality.clone())
-                    };
-                    let (clipped_seq, clipped_qual) = clip_read(&cr_seq, &cr_qual, clip5p, clip3p);
-                    let mut buffer = BufferedSamRecords::new();
-                    stats.record_read_bases(clipped_seq.len() as u64);
+                        let read = &sread.cdna;
+                        // CellRanger4 adapter clipping (TSO 5' + polyA 3') runs before
+                        // the fixed clip5p/clip3p Nbases trimming.
+                        let (cr_seq, cr_qual) = if cr4_clip {
+                            crate::solo::clip_adapter_cr4(&read.sequence, &read.quality)
+                        } else {
+                            (read.sequence.clone(), read.quality.clone())
+                        };
+                        let (clipped_seq, clipped_qual) =
+                            clip_read(&cr_seq, &cr_qual, clip5p, clip3p);
+                        let mut buffer = BufferedSamRecords::new();
+                        stats.record_read_bases(clipped_seq.len() as u64);
 
-                    if clipped_seq.is_empty() {
-                        stats.record_alignment(0, max_multimaps);
-                        stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
-                        // No alignment → barcode still counts toward stats (unmapped → no gene).
-                        let outcome = solo.process_read(&[], sread.barcode.as_ref(), &[]);
-                        return Ok(SoloReadProduct {
+                        if clipped_seq.is_empty() {
+                            stats.record_alignment(0, max_multimaps);
+                            stats.record_unmapped_reason(crate::stats::UnmappedReason::Other);
+                            // No alignment → barcode still counts toward stats (unmapped → no gene).
+                            let outcome = solo.process_read(&[], sread.barcode.as_ref(), &[]);
+                            return Ok(SoloReadProduct {
+                                sam_records: buffer,
+                                per_feature: outcome.per_feature,
+                                sj: outcome.sj,
+                                velocyto: outcome.velocyto,
+                            });
+                        }
+
+                        let (transcripts, _chimeric, n_for_mapq, unmapped_reason) =
+                            align_read(&clipped_seq, &read.name, &index, params)?;
+
+                        let n_for_stats = if transcripts.is_empty() && n_for_mapq > 0 {
+                            n_for_mapq
+                        } else {
+                            transcripts.len()
+                        };
+                        stats.record_alignment(n_for_stats, max_multimaps);
+                        if transcripts.is_empty() && unmapped_reason.is_some() {
+                            stats.record_unmapped_reason(
+                                unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
+                            );
+                        } else if transcripts.len() == 1 {
+                            stats.record_transcript_stats(&transcripts[0]);
+                        }
+
+                        let is_unique = transcripts.len() == 1;
+                        for transcript in &transcripts {
+                            record_transcript_junctions(transcript, &index, &sj_stats, is_unique);
+                        }
+
+                        // SJ feature: the junctions crossed by a uniquely-mapped read
+                        // (absolute intron coords), mapped to SJ.out.tab rows at output.
+                        let junctions: Vec<(u64, u64)> =
+                            if solo.sj_enabled && is_unique && transcripts[0].n_junction > 0 {
+                                extract_junction_keys(&transcripts[0], &index)
+                                    .into_iter()
+                                    .map(|k| (k.intron_start, k.intron_end))
+                                    .collect()
+                            } else {
+                                Vec::new()
+                            };
+
+                        // Solo quantification (CB match + UMI check + gene assignment).
+                        let outcome =
+                            solo.process_read(&transcripts, sread.barcode.as_ref(), &junctions);
+
+                        // Build SAM records for the cDNA alignment (same as SE path).
+                        // Skipped entirely under `--outSAMtype None` (count-only).
+                        if emit_sam {
+                            if transcripts.is_empty() {
+                                if output_unmapped {
+                                    let record = SamWriter::build_unmapped_record(
+                                        &read.name,
+                                        &clipped_seq,
+                                        &clipped_qual,
+                                        params,
+                                        unmapped_reason
+                                            .unwrap_or(crate::stats::UnmappedReason::Other),
+                                    )?;
+                                    buffer.push(record);
+                                }
+                            } else if transcripts.len() <= max_multimaps {
+                                let records = SamWriter::build_alignment_records(
+                                    &read.name,
+                                    &clipped_seq,
+                                    &clipped_qual,
+                                    &transcripts,
+                                    &index.genome,
+                                    params,
+                                    n_for_mapq,
+                                )?;
+                                for record in records {
+                                    buffer.push(record);
+                                }
+                            }
+                        }
+
+                        Ok(SoloReadProduct {
                             sam_records: buffer,
                             per_feature: outcome.per_feature,
                             sj: outcome.sj,
                             velocyto: outcome.velocyto,
-                        });
-                    }
+                        })
+                    })
+                    .collect();
 
-                    let (transcripts, _chimeric, n_for_mapq, unmapped_reason) =
-                        align_read(&clipped_seq, &read.name, &index, params)?;
-
-                    let n_for_stats = if transcripts.is_empty() && n_for_mapq > 0 {
-                        n_for_mapq
-                    } else {
-                        transcripts.len()
-                    };
-                    stats.record_alignment(n_for_stats, max_multimaps);
-                    if transcripts.is_empty() && unmapped_reason.is_some() {
-                        stats.record_unmapped_reason(
-                            unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
-                        );
-                    } else if transcripts.len() == 1 {
-                        stats.record_transcript_stats(&transcripts[0]);
-                    }
-
-                    let is_unique = transcripts.len() == 1;
-                    for transcript in &transcripts {
-                        record_transcript_junctions(transcript, &index, &sj_stats, is_unique);
-                    }
-
-                    // SJ feature: the junctions crossed by a uniquely-mapped read
-                    // (absolute intron coords), mapped to SJ.out.tab rows at output.
-                    let junctions: Vec<(u64, u64)> =
-                        if solo.sj_enabled && is_unique && transcripts[0].n_junction > 0 {
-                            extract_junction_keys(&transcripts[0], &index)
-                                .into_iter()
-                                .map(|k| (k.intron_start, k.intron_end))
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-
-                    // Solo quantification (CB match + UMI check + gene assignment).
-                    let outcome =
-                        solo.process_read(&transcripts, sread.barcode.as_ref(), &junctions);
-
-                    // Build SAM records for the cDNA alignment (same as SE path).
-                    // Skipped entirely under `--outSAMtype None` (count-only).
-                    if emit_sam {
-                        if transcripts.is_empty() {
-                            if output_unmapped {
-                                let record = SamWriter::build_unmapped_record(
-                                    &read.name,
-                                    &clipped_seq,
-                                    &clipped_qual,
-                                    params,
-                                    unmapped_reason.unwrap_or(crate::stats::UnmappedReason::Other),
-                                )?;
-                                buffer.push(record);
-                            }
-                        } else if transcripts.len() <= max_multimaps {
-                            let records = SamWriter::build_alignment_records(
-                                &read.name,
-                                &clipped_seq,
-                                &clipped_qual,
-                                &transcripts,
-                                &index.genome,
-                                params,
-                                n_for_mapq,
-                            )?;
-                            for record in records {
-                                buffer.push(record);
-                            }
+                // Sequential write + per-feature record collection.
+                let n_feat = solo.features.len();
+                let mut feat_records: Vec<Vec<SoloCountRecord>> =
+                    (0..n_feat).map(|_| Vec::new()).collect();
+                let mut feat_multi: Vec<Vec<SoloMultiRecord>> =
+                    (0..n_feat).map(|_| Vec::new()).collect();
+                let mut feat_multi_gene: Vec<Vec<crate::solo::MultiGeneRecord>> =
+                    (0..n_feat).map(|_| Vec::new()).collect();
+                let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
+                let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
+                for result in batch_results {
+                    let product = result?;
+                    writer.write_batch(&product.sam_records.records)?;
+                    for (fi, fo) in product.per_feature.into_iter().enumerate() {
+                        if let Some(r) = fo.record {
+                            feat_records[fi].push(r);
+                        }
+                        if let Some(m) = fo.multi {
+                            feat_multi[fi].push(m);
+                        }
+                        if let Some(mg) = fo.multi_gene {
+                            feat_multi_gene[fi].push(mg);
                         }
                     }
-
-                    Ok(SoloReadProduct {
-                        sam_records: buffer,
-                        per_feature: outcome.per_feature,
-                        sj: outcome.sj,
-                        velocyto: outcome.velocyto,
-                    })
-                })
-                .collect();
-
-            // Sequential write + per-feature record collection.
-            let n_feat = solo.features.len();
-            let mut feat_records: Vec<Vec<SoloCountRecord>> =
-                (0..n_feat).map(|_| Vec::new()).collect();
-            let mut feat_multi: Vec<Vec<SoloMultiRecord>> =
-                (0..n_feat).map(|_| Vec::new()).collect();
-            let mut feat_multi_gene: Vec<Vec<crate::solo::MultiGeneRecord>> =
-                (0..n_feat).map(|_| Vec::new()).collect();
-            let mut sj_batch: Vec<crate::solo::SjCountRecord> = Vec::new();
-            let mut velo_batch: Vec<crate::solo::VelocytoRecord> = Vec::new();
-            for result in batch_results {
-                let product = result?;
-                writer.write_batch(&product.sam_records.records)?;
-                for (fi, fo) in product.per_feature.into_iter().enumerate() {
-                    if let Some(r) = fo.record {
-                        feat_records[fi].push(r);
-                    }
-                    if let Some(m) = fo.multi {
-                        feat_multi[fi].push(m);
-                    }
-                    if let Some(mg) = fo.multi_gene {
-                        feat_multi_gene[fi].push(mg);
+                    sj_batch.extend(product.sj);
+                    velo_batch.extend(product.velocyto);
+                }
+                for (fi, recorder) in solo.recorders.iter().enumerate() {
+                    recorder.extend(
+                        std::mem::take(&mut feat_records[fi]),
+                        std::mem::take(&mut feat_multi[fi]),
+                    );
+                    let mg = std::mem::take(&mut feat_multi_gene[fi]);
+                    if !mg.is_empty() {
+                        recorder.multi_gene.lock().unwrap().extend(mg);
                     }
                 }
-                sj_batch.extend(product.sj);
-                velo_batch.extend(product.velocyto);
-            }
-            for (fi, recorder) in solo.recorders.iter().enumerate() {
-                recorder.extend(
-                    std::mem::take(&mut feat_records[fi]),
-                    std::mem::take(&mut feat_multi[fi]),
-                );
-                let mg = std::mem::take(&mut feat_multi_gene[fi]);
-                if !mg.is_empty() {
-                    recorder.multi_gene.lock().unwrap().extend(mg);
+                if !sj_batch.is_empty() {
+                    solo.sj_records.lock().unwrap().extend(sj_batch);
+                }
+                if !velo_batch.is_empty() {
+                    solo.velocyto_records.lock().unwrap().extend(velo_batch);
+                }
+
+                read_count += reads_to_process as u64;
+                if read_count % 100_000 < batch_size as u64 {
+                    info!("STARsolo: processed {read_count} reads...");
+                }
+                if read_count >= max_reads {
+                    break;
                 }
             }
-            if !sj_batch.is_empty() {
-                solo.sj_records.lock().unwrap().extend(sj_batch);
-            }
-            if !velo_batch.is_empty() {
-                solo.velocyto_records.lock().unwrap().extend(velo_batch);
-            }
-
-            read_count += reads_to_process as u64;
-            if read_count % 100_000 < batch_size as u64 {
-                info!("STARsolo: processed {read_count} reads...");
-            }
-            if read_count >= max_reads {
-                break;
-            }
-        }
-        Ok(())
+            Ok(())
+        })();
+        // Disconnect so a producer blocked on the bounded channel can finish,
+        // letting the scope join cleanly (see the IIFE comment above).
+        drop(rx);
+        result
     })?;
 
     Ok(())
