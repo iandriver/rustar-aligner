@@ -365,64 +365,98 @@ fn build_matrix_body(
         }
         drop(multi);
 
-        // Group each cell's reads together so we can process + free one at a time.
-        records.sort_unstable_by_key(|r| r.cb);
+        // Group each cell's reads together (parallel sort — the record vec is large).
+        use rayon::prelude::*;
+        records.par_sort_unstable_by_key(|r| r.cb);
 
+        // One contiguous [start, end) slice per CB.
+        let mut bounds: Vec<(usize, usize)> = Vec::new();
         let mut i = 0;
         while i < records.len() {
             let cb = records[i].cb;
-
-            // umi → gene → read multiplicity, for this cell only.
-            let mut umi_genes: HashMap<u64, HashMap<u32, u32>> = HashMap::new();
-            let mut j = i;
+            let mut j = i + 1;
             while j < records.len() && records[j].cb == cb {
-                let r = &records[j];
-                *umi_genes
-                    .entry(r.umi)
-                    .or_default()
-                    .entry(r.gene)
-                    .or_insert(0) += 1;
                 j += 1;
             }
+            bounds.push((i, j));
+            i = j;
+        }
 
-            // (gene → (umi → read_count)) after multi-gene UMI filtering.
-            let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::new();
-            for (&umi, genes) in &umi_genes {
-                for (&gene, &rc) in filter_multi_gene_umi(genes, filtering) {
-                    *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
-                }
-            }
+        // Per-cell dedup + MatrixMarket formatting is independent across cells, so
+        // run it in parallel and emit the pre-formatted bodies sequentially in CB
+        // order. This keeps the matrix byte-identical to the serial version.
+        struct CellOut {
+            body: Vec<u8>,
+            stat: Option<CellStat>,
+            genes: Vec<u32>,
+        }
+        let cell_outs: Vec<CellOut> = bounds
+            .par_iter()
+            .map(|&(i, j)| {
+                let cb = records[i].cb;
 
-            // Collapse UMIs per gene, then emit this cell's entries gene-ascending.
-            let mut cell_entries: Vec<(u32, u64)> = Vec::with_capacity(gene_umis.len());
-            for (&gene, umis) in &gene_umis {
-                let count = dedup_count(umis, method, umi_len);
-                if count > 0 {
-                    cell_entries.push((gene, count));
+                // umi → gene → read multiplicity, for this cell only.
+                let mut umi_genes: HashMap<u64, HashMap<u32, u32>> = HashMap::new();
+                for r in &records[i..j] {
+                    *umi_genes
+                        .entry(r.umi)
+                        .or_default()
+                        .entry(r.gene)
+                        .or_insert(0) += 1;
                 }
-            }
-            cell_entries.sort_unstable_by_key(|&(g, _)| g);
-            // Per-cell summary: reads = records (j-i), genes = nonzero entries,
-            // UMIs = sum of deduped counts.
-            let n_reads = (j - i) as u64;
-            let n_genes = cell_entries.len() as u32;
-            let mut n_umis = 0u64;
-            for (g, c) in cell_entries {
-                n_umis += c;
-                gene_seen[g as usize] = true;
-                writeln!(body, "{} {} {}", g + 1, cb + 1, c).map_err(|e| Error::io(e, dir))?;
-                nnz += 1;
-            }
-            if n_umis > 0 {
-                cell_stats.push(CellStat {
+
+                // (gene → (umi → read_count)) after multi-gene UMI filtering.
+                let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::new();
+                for (&umi, genes) in &umi_genes {
+                    for (&gene, &rc) in filter_multi_gene_umi(genes, filtering) {
+                        *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
+                    }
+                }
+
+                // Collapse UMIs per gene, then emit this cell's entries gene-ascending.
+                let mut cell_entries: Vec<(u32, u64)> = Vec::with_capacity(gene_umis.len());
+                for (&gene, umis) in &gene_umis {
+                    let count = dedup_count(umis, method, umi_len);
+                    if count > 0 {
+                        cell_entries.push((gene, count));
+                    }
+                }
+                cell_entries.sort_unstable_by_key(|&(g, _)| g);
+
+                let n_reads = (j - i) as u64;
+                let n_genes = cell_entries.len() as u32;
+                let mut n_umis = 0u64;
+                let mut cbody: Vec<u8> = Vec::new();
+                let mut genes: Vec<u32> = Vec::with_capacity(cell_entries.len());
+                for (g, c) in &cell_entries {
+                    n_umis += *c;
+                    genes.push(*g);
+                    let _ = writeln!(cbody, "{} {} {}", g + 1, cb + 1, c);
+                }
+                let stat = (n_umis > 0).then_some(CellStat {
                     cb,
                     n_reads,
                     n_umis,
                     n_genes,
                 });
-            }
+                CellOut {
+                    body: cbody,
+                    stat,
+                    genes,
+                }
+            })
+            .collect();
 
-            i = j;
+        // Sequential merge: byte order preserved (CB-ascending, gene-ascending).
+        for co in cell_outs {
+            body.write_all(&co.body).map_err(|e| Error::io(e, dir))?;
+            nnz += co.genes.len();
+            for g in co.genes {
+                gene_seen[g as usize] = true;
+            }
+            if let Some(s) = co.stat {
+                cell_stats.push(s);
+            }
         }
         body.flush().map_err(|e| Error::io(e, dir))?;
     }
@@ -659,8 +693,9 @@ fn build_multi_matrices(
     if methods.is_empty() {
         return Ok(());
     }
+    use rayon::prelude::*;
     let mut multi: Vec<&crate::solo::MultiGeneRecord> = multi_records.iter().collect();
-    multi.sort_unstable_by_key(|r| r.cb);
+    multi.par_sort_unstable_by_key(|r| r.cb);
 
     // Per-method temp body + entry count.
     let mut bodies: Vec<tempfile::NamedTempFile> = Vec::new();
@@ -973,28 +1008,51 @@ fn emptydrops_called(
             e.to_string(),
         ))
     })?;
-    let mut rng = rand::rngs::StdRng::seed_from_u64(19_760_110);
-    let mut sim_at: Vec<Vec<f64>> = vec![Vec::with_capacity(sim_n); max_count + 1];
-    let mut curr = vec![0u32; n_features];
-    for _ in 0..sim_n {
-        curr.fill(0);
-        let mut lp = 0f64;
-        sim_at[0].push(0.0);
-        #[allow(clippy::needless_range_loop)] // ic is both index and multinomial term
-        for ic in 1..=max_count {
-            let gi = nonzero[dist.sample(&mut rng)];
-            curr[gi] += 1;
-            lp += amb_logp[gi] + (ic as f64).ln() - (curr[gi] as f64).ln();
-            sim_at[ic].push(lp);
-        }
-    }
+    // Each simulation is an independent ambient random walk. Seed a dedicated RNG
+    // per simulation (splitmix-derived from the base seed) so the result is
+    // deterministic regardless of how the work is scheduled across threads, then
+    // run the simulations in parallel. Each walk records the running log-prob at
+    // every count level; `walks[s][k]` is the log-prob of simulation `s` after `k`
+    // draws. (This matches STAR's per-thread-RNG approach; the per-sim seeding
+    // gives different draws than a single sequential stream, but the same
+    // distribution — p-values are stable to Monte-Carlo error.)
+    use rayon::prelude::*;
+    const BASE_SEED: u64 = 19_760_110;
+    let walks: Vec<Vec<f64>> = (0..sim_n)
+        .into_par_iter()
+        .map_init(
+            || (vec![0u32; n_features], Vec::<usize>::new()),
+            |(curr, touched), s| {
+                let seed = BASE_SEED ^ (s as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+                touched.clear();
+                let mut walk = Vec::with_capacity(max_count + 1);
+                walk.push(0.0);
+                let mut lp = 0f64;
+                for ic in 1..=max_count {
+                    let gi = nonzero[dist.sample(&mut rng)];
+                    if curr[gi] == 0 {
+                        touched.push(gi);
+                    }
+                    curr[gi] += 1;
+                    lp += amb_logp[gi] + (ic as f64).ln() - (curr[gi] as f64).ln();
+                    walk.push(lp);
+                }
+                for &gi in touched.iter() {
+                    curr[gi] = 0; // reset only touched entries for the next reuse
+                }
+                walk
+            },
+        )
+        .collect();
 
     // p-values + Benjamini-Hochberg.
+    let inv = 1.0 / (1 + sim_n) as f64;
     let mut pvals: Vec<(u32, f64)> = obs
-        .iter()
+        .par_iter()
         .map(|&(cb, total, o)| {
-            let lower = sim_at[total].iter().filter(|&&sp| sp < o).count();
-            (cb, (1 + lower) as f64 / (1 + sim_n) as f64)
+            let lower = walks.iter().filter(|w| w[total] < o).count();
+            (cb, (1 + lower) as f64 * inv)
         })
         .collect();
     pvals.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
@@ -1330,8 +1388,9 @@ fn build_sj_matrix(
     gzip: bool,
 ) -> Result<usize, Error> {
     // Group by cell barcode (ascending column order).
+    use rayon::prelude::*;
     let mut recs: Vec<&crate::solo::SjCountRecord> = records.iter().collect();
-    recs.sort_unstable_by_key(|r| r.cb);
+    recs.par_sort_unstable_by_key(|r| r.cb);
 
     let dir = matrix_path.parent().unwrap_or_else(|| Path::new("."));
     let mut body_tmp = tempfile::Builder::new()
@@ -1411,7 +1470,66 @@ fn build_velocyto_matrices(
     let names = ["spliced.mtx", "unspliced.mtx", "ambiguous.mtx"];
 
     let mut recs: Vec<&crate::solo::VelocytoRecord> = records.iter().collect();
-    recs.sort_unstable_by_key(|r| r.cb);
+    use rayon::prelude::*;
+    recs.par_sort_unstable_by_key(|r| r.cb);
+
+    // One contiguous [start, end) slice per CB.
+    let mut bounds: Vec<(usize, usize)> = Vec::new();
+    let mut i = 0;
+    while i < recs.len() {
+        let cb = recs[i].cb;
+        let mut j = i + 1;
+        while j < recs.len() && recs[j].cb == cb {
+            j += 1;
+        }
+        bounds.push((i, j));
+        i = j;
+    }
+
+    // Per-cell dedup is independent across cells → run in parallel, each cell
+    // producing the three matrices' lines (gene-ascending). Merge sequentially
+    // in CB order so the three .mtx files stay byte-identical to the serial path.
+    type VeloCellOut = ([Vec<u8>; 3], [usize; 3]);
+    let cell_outs: Vec<VeloCellOut> = bounds
+        .par_iter()
+        .map(|&(lo, hi)| {
+            let cb = recs[lo].cb;
+            // gene → umi → (resolved category, read count)
+            let mut gene_umi: HashMap<u32, HashMap<u64, (VelocytoCategory, u32)>> = HashMap::new();
+            for &r in &recs[lo..hi] {
+                let e = gene_umi
+                    .entry(r.gene)
+                    .or_default()
+                    .entry(r.umi)
+                    .or_insert((r.category, 0));
+                e.1 += 1;
+                if priority(r.category) > priority(e.0) {
+                    e.0 = r.category;
+                }
+            }
+            // Per gene, dedup UMIs within each resolved category, emit entries.
+            let mut genes: Vec<&u32> = gene_umi.keys().collect();
+            genes.sort_unstable();
+            let mut bufs: [Vec<u8>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            let mut cnt = [0usize; 3];
+            for &g in &genes {
+                let umis = &gene_umi[g];
+                let mut by_cat: [HashMap<u64, u32>; 3] =
+                    [HashMap::new(), HashMap::new(), HashMap::new()];
+                for (&umi, &(cat, rc)) in umis {
+                    by_cat[cat_idx(cat)].insert(umi, rc);
+                }
+                for (k, buf) in bufs.iter_mut().enumerate() {
+                    let c = dedup_count(&by_cat[k], method, umi_len);
+                    if c > 0 {
+                        let _ = writeln!(buf, "{} {} {}", g + 1, cb + 1, c);
+                        cnt[k] += 1;
+                    }
+                }
+            }
+            (bufs, cnt)
+        })
+        .collect();
 
     let mut bodies: Vec<tempfile::NamedTempFile> = Vec::new();
     for _ in 0..3 {
@@ -1428,41 +1546,10 @@ fn build_velocyto_matrices(
             .iter_mut()
             .map(|t| std::io::BufWriter::new(t.as_file_mut()))
             .collect();
-        let mut i = 0;
-        while i < recs.len() {
-            let cb = recs[i].cb;
-            // gene → umi → (resolved category, read count)
-            let mut gene_umi: HashMap<u32, HashMap<u64, (VelocytoCategory, u32)>> = HashMap::new();
-            while i < recs.len() && recs[i].cb == cb {
-                let r = recs[i];
-                let e = gene_umi
-                    .entry(r.gene)
-                    .or_default()
-                    .entry(r.umi)
-                    .or_insert((r.category, 0));
-                e.1 += 1;
-                if priority(r.category) > priority(e.0) {
-                    e.0 = r.category;
-                }
-                i += 1;
-            }
-            // Per gene, dedup UMIs within each resolved category, emit entries.
-            let mut genes: Vec<&u32> = gene_umi.keys().collect();
-            genes.sort_unstable();
-            for &g in &genes {
-                let umis = &gene_umi[g];
-                let mut by_cat: [HashMap<u64, u32>; 3] =
-                    [HashMap::new(), HashMap::new(), HashMap::new()];
-                for (&umi, &(cat, rc)) in umis {
-                    by_cat[cat_idx(cat)].insert(umi, rc);
-                }
-                for (k, w) in writers.iter_mut().enumerate() {
-                    let c = dedup_count(&by_cat[k], method, umi_len);
-                    if c > 0 {
-                        writeln!(w, "{} {} {}", g + 1, cb + 1, c).map_err(|e| Error::io(e, dir))?;
-                        nnz[k] += 1;
-                    }
-                }
+        for (bufs, cnt) in &cell_outs {
+            for (k, w) in writers.iter_mut().enumerate() {
+                w.write_all(&bufs[k]).map_err(|e| Error::io(e, dir))?;
+                nnz[k] += cnt[k];
             }
         }
         for w in &mut writers {
