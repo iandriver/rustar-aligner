@@ -1029,6 +1029,95 @@ fn test_starsolo_gene_matrix() {
 }
 
 // ---------------------------------------------------------------------------
+// Test 9a' — Summary.csv stays STARsolo-faithful; the CellRanger mapping funnel
+// (exonic/intronic/intergenic/antisense) is split out into a separate
+// CellRanger.summary.csv (PR #90 review: keep the faithful Summary.csv unaltered).
+// Needs Gene + GeneFull — the exonic/intronic split requires both queries.
+// ---------------------------------------------------------------------------
+#[test]
+fn test_starsolo_summary_split() {
+    let tmpdir = TempDir::new().unwrap();
+    let genome = build_genome();
+    let fasta = write_fasta(&tmpdir, &genome);
+    let gtf = write_gtf(&tmpdir);
+    let genome_dir = tmpdir.path().join("genome");
+    build_index(&fasta, &genome_dir, "7", Some(&gtf));
+
+    let cdna_path = tmpdir.path().join("cdna.fq");
+    let bc_path = tmpdir.path().join("bc.fq");
+    let wl_path = tmpdir.path().join("whitelist.txt");
+    let cb = "AAAACCCCGGGGTTTT";
+    {
+        let mut cf = fs::File::create(&cdna_path).unwrap();
+        let mut bf = fs::File::create(&bc_path).unwrap();
+        let exon = &genome[10000..10050]; // exonic read → populates the funnel
+        for (i, umi) in ["ACGTACGTACGT", "TGCATGCATGCA"].iter().enumerate() {
+            writeln!(cf, "@r{i}").unwrap();
+            cf.write_all(exon).unwrap();
+            writeln!(cf, "\n+\n{}", "I".repeat(exon.len())).unwrap();
+            writeln!(bf, "@r{i}\n{cb}{umi}\n+\n{}", "I".repeat(28)).unwrap();
+        }
+        fs::write(&wl_path, format!("{cb}\nCCCCGGGGTTTTAAAA\n")).unwrap();
+    }
+
+    let output_dir = tmpdir.path().join("out_split");
+    fs::create_dir_all(&output_dir).unwrap();
+    let prefix = format!("{}/", output_dir.display());
+    cargo_bin_cmd!("rustar-aligner")
+        .args([
+            "--runMode",
+            "alignReads",
+            "--genomeDir",
+            genome_dir.to_str().unwrap(),
+            "--readFilesIn",
+            cdna_path.to_str().unwrap(),
+            bc_path.to_str().unwrap(),
+            "--soloType",
+            "CB_UMI_Simple",
+            "--soloCBwhitelist",
+            wl_path.to_str().unwrap(),
+            "--soloCBstart",
+            "1",
+            "--soloCBlen",
+            "16",
+            "--soloUMIstart",
+            "17",
+            "--soloUMIlen",
+            "12",
+            "--soloFeatures",
+            "Gene",
+            "GeneFull",
+            "--soloStrand",
+            "Forward",
+            "--sjdbGTFfile",
+            gtf.to_str().unwrap(),
+            "--outFileNamePrefix",
+            &prefix,
+        ])
+        .assert()
+        .success();
+
+    let gene = output_dir.join("Solo.out").join("Gene");
+    let summary = fs::read_to_string(gene.join("Summary.csv")).unwrap();
+    // Faithful Summary.csv must NOT carry the CellRanger funnel rows.
+    assert!(
+        !summary.contains("Exonic Regions") && !summary.contains("Antisense to Gene"),
+        "Summary.csv leaked CellRanger funnel rows:\n{summary}"
+    );
+    assert!(
+        summary.contains("Estimated Number of Cells"),
+        "summary:\n{summary}"
+    );
+    // The funnel lives in a separate additional file.
+    let cr = fs::read_to_string(gene.join("CellRanger.summary.csv")).unwrap();
+    assert!(
+        cr.contains("Reads Mapped Confidently to Exonic Regions")
+            && cr.contains("Reads Mapped Antisense to Gene"),
+        "CellRanger.summary.csv missing funnel rows:\n{cr}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Test 9b — STARsolo SJ (splice-junction) feature
 //
 // Spliced cDNA reads (last 25 bp of Exon1 + first 25 bp of Exon2) cross the

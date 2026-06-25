@@ -1295,9 +1295,23 @@ pub fn write_gene_matrix(
             mapped_unique,
             mapped_multi,
             reads_of(*feature),
-            region,
         )?;
         log::info!("STARsolo: wrote {}/Summary.csv", feature.dir_name());
+        // CellRanger-style mapping funnel goes in a SEPARATE additional file so the
+        // faithful Summary.csv is never altered (PR #90 review: keep this release a
+        // drop-in faithful port; output-changing features come later).
+        if let Some(r) = region {
+            write_cellranger_summary(
+                &feature_dir.join("CellRanger.summary.csv"),
+                total_reads,
+                mapped_unique,
+                r,
+            )?;
+            log::info!(
+                "STARsolo: wrote {}/CellRanger.summary.csv",
+                feature.dir_name()
+            );
+        }
     }
 
     // SJ (splice-junction) feature: rows are the SJ.out.tab junctions.
@@ -1611,9 +1625,11 @@ struct RegionFunnel {
     antisense: u64,
 }
 
-/// Write a CellRanger/STARsolo-style `Summary.csv` for one feature: the
-/// sequencing/mapping funnel (genome → exonic → intronic → intergenic, antisense)
-/// plus per-cell UMI/gene statistics over the CR2.2-knee-called cells.
+/// Write the STARsolo-faithful `Summary.csv` for one feature: the sequencing /
+/// genome-mapping rows plus per-cell UMI/gene statistics over the CR2.2-knee-called
+/// cells. The CellRanger-style exonic/intronic/intergenic/antisense funnel is a
+/// rustar extension kept in a SEPARATE file (see `write_cellranger_summary`) so
+/// this file is never altered relative to STARsolo's own Summary.csv.
 #[allow(clippy::too_many_arguments)]
 fn write_summary(
     path: &Path,
@@ -1624,7 +1640,6 @@ fn write_summary(
     mapped_unique: u64,
     mapped_multi: u64,
     feature_mapped: u64,
-    region: Option<RegionFunnel>,
 ) -> Result<(), Error> {
     let frac = |num: u64| -> f64 {
         if total_reads == 0 {
@@ -1690,27 +1705,6 @@ fn write_summary(
         &format!("Reads Mapped to {feature_name}: Unique {feature_name}"),
         format!("{:.6}", frac(feature_mapped)),
     );
-    // CellRanger-style positional funnel over uniquely-mapped reads (each region
-    // counted by where the read falls, independent of strand; antisense is a
-    // separate orientation metric). Available only with Gene + GeneFull.
-    if let Some(r) = region {
-        row(
-            "Reads Mapped Confidently to Exonic Regions",
-            format!("{:.6}", frac(r.exonic)),
-        );
-        row(
-            "Reads Mapped Confidently to Intronic Regions",
-            format!("{:.6}", frac(r.intronic)),
-        );
-        row(
-            "Reads Mapped Confidently to Intergenic Regions",
-            format!("{:.6}", frac(r.intergenic)),
-        );
-        row(
-            "Reads Mapped Antisense to Gene",
-            format!("{:.6}", frac(r.antisense)),
-        );
-    }
     row("Estimated Number of Cells", n_cells.to_string());
     row(
         &format!("Unique Reads in Cells Mapped to {feature_name}"),
@@ -1751,6 +1745,54 @@ fn write_summary(
         mstats.genes_detected.to_string(),
     );
 
+    std::fs::write(path, out).map_err(|e| Error::io(e, path))?;
+    Ok(())
+}
+
+/// Write the CellRanger-style positional mapping funnel (exonic / intronic /
+/// intergenic + antisense, as fractions of total reads) to a SEPARATE additional
+/// file, so the faithful STARsolo `Summary.csv` is never altered by this rustar
+/// extension. Only emitted when both `Gene` and `GeneFull` run (the exonic/intronic
+/// split needs both queries).
+fn write_cellranger_summary(
+    path: &Path,
+    total_reads: u64,
+    mapped_unique: u64,
+    region: RegionFunnel,
+) -> Result<(), Error> {
+    let frac = |num: u64| -> f64 {
+        if total_reads == 0 {
+            0.0
+        } else {
+            num as f64 / total_reads as f64
+        }
+    };
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let mut row = |k: &str, v: String| {
+        let _ = writeln!(out, "{k},{v}");
+    };
+    row("Number of Reads", total_reads.to_string());
+    row(
+        "Reads Mapped to Genome: Unique",
+        format!("{:.6}", frac(mapped_unique)),
+    );
+    row(
+        "Reads Mapped Confidently to Exonic Regions",
+        format!("{:.6}", frac(region.exonic)),
+    );
+    row(
+        "Reads Mapped Confidently to Intronic Regions",
+        format!("{:.6}", frac(region.intronic)),
+    );
+    row(
+        "Reads Mapped Confidently to Intergenic Regions",
+        format!("{:.6}", frac(region.intergenic)),
+    );
+    row(
+        "Reads Mapped Antisense to Gene",
+        format!("{:.6}", frac(region.antisense)),
+    );
     std::fs::write(path, out).map_err(|e| Error::io(e, path))?;
     Ok(())
 }
