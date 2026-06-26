@@ -373,7 +373,9 @@ pub fn cluster_seeds(
     read_len: usize,
     _debug: bool,
 ) -> Vec<SeedCluster> {
-    use std::collections::HashMap;
+    // Integer-keyed maps in this hot path (the #1 align hotspot, ~19% self-time):
+    // FxHash, not the default SipHash, and pre-sized to avoid rehashing.
+    use rustc_hash::{FxBuildHasher, FxHashMap};
 
     let win_bin_nbits = params.win_bin_nbits;
     let win_anchor_dist_nbins = params.win_anchor_dist_nbins;
@@ -481,7 +483,8 @@ pub fn cluster_seeds(
     let mut windows: Vec<Window> = Vec::new();
     // winBin: (strand, bin) → window_index
     // Chromosome is implicit since bins are from absolute forward positions
-    let mut win_bin: HashMap<(bool, u64), usize> = HashMap::new();
+    let mut win_bin: FxHashMap<(bool, u64), usize> =
+        FxHashMap::with_capacity_and_hasher(anchor_indices.len() * 2, FxBuildHasher);
 
     for &anchor_idx in &anchor_indices {
         let anchor = &seeds[anchor_idx];
@@ -755,7 +758,8 @@ pub fn cluster_seeds(
         // For each (diagonal, mate_id) pair, track accepted [ps_rstart, ps_rend) ranges.
         // STAR's assignAlignToWindow checks aFrag==WA[iA][WA_iFrag] before overlap test:
         // seeds from different fragments are never treated as overlapping duplicates.
-        let mut diag_ranges: HashMap<(i64, u8), Vec<(usize, usize)>> = HashMap::new();
+        let mut diag_ranges: FxHashMap<(i64, u8), Vec<(usize, usize)>> =
+            FxHashMap::with_capacity_and_hasher(candidates.len(), FxBuildHasher);
         for &ci in &by_len {
             let cand = &candidates[ci];
             let diag = cand.forward_pos as i64 - cand.ps_rstart as i64;
