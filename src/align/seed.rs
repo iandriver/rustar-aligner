@@ -95,7 +95,13 @@ impl Seed {
         // Matches STAR's OPTIM_STOREaligns_SIMPLE: `if (PC[iP][PC_rStart]==rStart) &&
         // PC[iP][PC_Length]==L) return; //same alignment as before, do not store!`
         {
-            let mut seen = std::collections::HashSet::new();
+            // Integer-keyed dedup in the per-read seed path: FxHash + pre-sized
+            // (default SipHash + growth-rehash showed up in profiling).
+            let mut seen: rustc_hash::FxHashSet<(usize, usize, bool)> =
+                rustc_hash::FxHashSet::with_capacity_and_hasher(
+                    seeds.len(),
+                    rustc_hash::FxBuildHasher,
+                );
             seeds.retain(|s| seen.insert((s.read_pos, s.length, s.search_rc)));
         }
 

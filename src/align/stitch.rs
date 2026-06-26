@@ -480,7 +480,8 @@ pub fn cluster_seeds(
         wa_lrec: usize,
     }
 
-    let mut windows: Vec<Window> = Vec::new();
+    // At most one window per anchor position — pre-size to avoid growth reallocs.
+    let mut windows: Vec<Window> = Vec::with_capacity(anchor_indices.len());
     // winBin: (strand, bin) → window_index
     // Chromosome is implicit since bins are from absolute forward positions
     let mut win_bin: FxHashMap<(bool, u64), usize> =
