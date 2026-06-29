@@ -27,6 +27,16 @@ fn main() -> anyhow::Result<()> {
         .unwrap_or(-1);
     unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_PURGE_DELAY, purge_ms) };
 
+    // Don't eagerly commit whole arenas. On Linux (an overcommit OS) mimalloc's
+    // default (arena_eager_commit=2) commits a large arena pool up front — measured
+    // as ~15 GB of committed-but-never-touched reserve, inflating RssAnon to ~17 GB
+    // despite only ~2 GB of live data. Committing arenas on demand instead drops
+    // RssAnon 17 GB -> 2 GB and Max RSS 41 -> 26 GB at ~3% wall cost (the on-demand
+    // commit faults). See test/aws/mem_tune.sh. `mi_option_arena_eager_commit` is
+    // option 4 in mimalloc v2.x. SAFETY: trivial c_int FFI call.
+    const MI_OPTION_ARENA_EAGER_COMMIT: std::os::raw::c_int = 4;
+    unsafe { libmimalloc_sys::mi_option_set(MI_OPTION_ARENA_EAGER_COMMIT, 0) };
+
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     cpu::check_cpu_compat()?;
