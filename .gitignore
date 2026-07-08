@@ -43,3 +43,6 @@ target
 
 # amd64 Linux build dir for the benchmark container
 /target-amd64/
+
+# macOS Finder metadata
+.DS_Store
