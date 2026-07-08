@@ -16,7 +16,7 @@ pub fn prefetch_read(ptr: *const u8) {
     {
         // SAFETY: _mm_prefetch is a hint; it never dereferences/faults.
         unsafe {
-            core::arch::x86_64::_mm_prefetch(ptr as *const i8, core::arch::x86_64::_MM_HINT_T0);
+            core::arch::x86_64::_mm_prefetch(ptr.cast::<i8>(), core::arch::x86_64::_MM_HINT_T0);
         }
     }
     #[cfg(target_arch = "aarch64")]
