@@ -260,6 +260,11 @@ impl Genome {
     ///
     /// # Returns
     /// The base value (0-3 for ACGT, 4 for N, 5 for padding), or None if out of bounds.
+    ///
+    /// `#[inline]`: called per-byte in the hottest loops (`extend_alignment`'s DP
+    /// scan, `cluster_seeds`) — uninlined, this is a real function-call boundary on
+    /// every base, unlike STAR's plain `G[i]` array indexing it stands in for.
+    #[inline]
     pub fn get_base(&self, pos: u64) -> Option<u8> {
         if pos < self.sequence.len() as u64 {
             Some(self.sequence.base(pos as usize))
