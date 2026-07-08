@@ -167,6 +167,22 @@ impl PackedArray {
         (word >> bit_shift) & self.bit_rec_mask
     }
 
+    /// Software-prefetch the cache line backing element `index` so a later
+    /// [`read`](Self::read) of it finds its bytes already in cache. A hint only —
+    /// out-of-range indices are clamped and never dereferenced.
+    #[inline]
+    pub fn prefetch(&self, index: usize) {
+        if index >= self.length {
+            return;
+        }
+        let byte_offset = (index as u64 * self.word_length as u64 / 8) as usize;
+        let data = self.data.as_slice();
+        if byte_offset < data.len() {
+            // SAFETY: byte_offset is in bounds; prefetch never dereferences.
+            crate::cpu::prefetch_read(unsafe { data.as_ptr().add(byte_offset) });
+        }
+    }
+
     /// Get the number of elements.
     pub fn len(&self) -> usize {
         self.length

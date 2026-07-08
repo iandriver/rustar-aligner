@@ -1024,6 +1024,14 @@ impl Parameters {
             ));
         }
 
+        // Sparse suffix array stride must be >= 1 (1 = dense, STAR default).
+        if params.genome_sa_sparse_d == 0 {
+            return Err(command.error(
+                ErrorKind::ValueValidation,
+                "--genomeSAsparseD must be >= 1 (1 = dense suffix array)",
+            ));
+        }
+
         // alignReads requires read files — except SmartSeq, which gets its reads
         // from --readFilesManifest instead.
         if params.run_mode == RunMode::AlignReads

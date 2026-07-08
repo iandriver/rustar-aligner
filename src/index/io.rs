@@ -196,6 +196,10 @@ fn load_genome(genome_dir: &Path, _params: &Parameters) -> Result<Genome, Error>
     let file = File::open(&genome_path).map_err(|e| Error::io(e, &genome_path))?;
     // SAFETY: Genome is opened read-only and never mutated while loaded.
     let mmap = unsafe { memmap2::Mmap::map(&file).map_err(|e| Error::io(e, &genome_path))? };
+    // Each `compare_seq_to_genome` touches only a read-length run of bytes (≪ one
+    // page) at a genome position that is effectively random across reads, so kernel
+    // readahead past that page is wasted I/O — same rationale as the SA/SAindex maps.
+    advise_random(&mmap);
 
     if mmap.len() != n_genome as usize {
         return Err(Error::Index(format!(

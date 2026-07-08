@@ -40,6 +40,12 @@ impl SuffixArray {
         crate::index::sa_build::build(genome)
     }
 
+    /// Build the suffix array with STAR's `--genomeSAsparseD` stride (see
+    /// [`crate::index::sa_build::build_sparse`]). `sparse_d == 1` is the dense SA.
+    pub fn build_sparse(genome: &Genome, sparse_d: u64) -> Result<Self, Error> {
+        crate::index::sa_build::build_sparse(genome, sparse_d)
+    }
+
     /// Get the number of suffixes in the array.
     pub fn len(&self) -> usize {
         self.data.len()
@@ -60,6 +66,14 @@ impl SuffixArray {
     /// Read a suffix array entry.
     pub fn get(&self, index: usize) -> u64 {
         self.data.read(index)
+    }
+
+    /// Software-prefetch the SA entry at `index` (hint only; see
+    /// [`crate::index::packed_array::PackedArray::prefetch`]). Used to overlap the
+    /// random SA loads of the binary search with the current probe's genome compare.
+    #[inline]
+    pub fn prefetch(&self, index: usize) {
+        self.data.prefetch(index);
     }
 }
 
