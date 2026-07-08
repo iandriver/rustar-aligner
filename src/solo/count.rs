@@ -12,7 +12,11 @@
 use crate::error::Error;
 use crate::solo::whitelist::CbWhitelist;
 use crate::solo::{SoloContext, SoloCountRecord};
-use std::collections::HashMap;
+// FxHash (non-cryptographic) rather than std's SipHash: every map here is keyed
+// on packed integers (u64 UMIs, u32 gene/cell ids) on the per-cell UMI-dedup hot
+// path, where SipHash is ~3-5x slower and buys nothing. Output is unchanged —
+// results are sorted before emission, and FxHash is deterministic.
+use rustc_hash::FxHashMap as HashMap;
 use std::io::{BufRead, BufReader, Write as _};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -396,7 +400,7 @@ fn build_matrix_body(
                 let cb = records[i].cb;
 
                 // umi → gene → read multiplicity, for this cell only.
-                let mut umi_genes: HashMap<u64, HashMap<u32, u32>> = HashMap::new();
+                let mut umi_genes: HashMap<u64, HashMap<u32, u32>> = HashMap::default();
                 for r in &records[i..j] {
                     *umi_genes
                         .entry(r.umi)
@@ -406,7 +410,7 @@ fn build_matrix_body(
                 }
 
                 // (gene → (umi → read_count)) after multi-gene UMI filtering.
-                let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::new();
+                let mut gene_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
                 for (&umi, genes) in &umi_genes {
                     for (&gene, &rc) in filter_multi_gene_umi(genes, filtering) {
                         *gene_umis.entry(gene).or_default().entry(umi).or_insert(0) += rc;
@@ -608,7 +612,7 @@ fn distribute_multi(
         }
         MultiMethod::Rescue => {
             // Weights = unique counts + a uniform spread of the multi molecules.
-            let mut unif: HashMap<u32, f64> = HashMap::new();
+            let mut unif: HashMap<u32, f64> = HashMap::default();
             for s in molecules {
                 let w = unit(s);
                 for &g in s {
@@ -714,7 +718,7 @@ fn build_multi_matrices(
         while *mptr < multi.len() && multi[*mptr].cb < cb {
             *mptr += 1; // skip multi-only cells (no unique gene)
         }
-        let mut by_umi: HashMap<u64, std::collections::BTreeSet<u32>> = HashMap::new();
+        let mut by_umi: HashMap<u64, std::collections::BTreeSet<u32>> = HashMap::default();
         while *mptr < multi.len() && multi[*mptr].cb == cb {
             let r = multi[*mptr];
             by_umi
@@ -739,7 +743,7 @@ fn build_multi_matrices(
         );
         let mut mptr = 0usize;
         let mut cur_cb: Option<u32> = None;
-        let mut u_map: HashMap<u32, f64> = HashMap::new();
+        let mut u_map: HashMap<u32, f64> = HashMap::default();
 
         let mut flush = |cb: u32,
                          u: &HashMap<u32, f64>,
@@ -932,7 +936,7 @@ fn emptydrops_called(
     // Re-read the raw body for ambient (summed) + per-candidate profiles.
     let mut ambient = vec![0f64; n_features];
     let mut amb_total = 0f64;
-    let mut cand_profiles: HashMap<u32, Vec<(u32, u32)>> = HashMap::new();
+    let mut cand_profiles: HashMap<u32, Vec<(u32, u32)>> = HashMap::default();
     let reader =
         BufReader::new(std::fs::File::open(body.path()).map_err(|e| Error::io(e, body.path()))?);
     for line in reader.lines() {
@@ -1433,7 +1437,7 @@ fn build_sj_matrix(
         while i < recs.len() {
             let cb = recs[i].cb;
             // junction row → (umi → read count) for this cell.
-            let mut sj_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::new();
+            let mut sj_umis: HashMap<u32, HashMap<u64, u32>> = HashMap::default();
             while i < recs.len() && recs[i].cb == cb {
                 let r = recs[i];
                 if let Some(&rw) = row.get(&(r.intron_start, r.intron_end)) {
@@ -1531,7 +1535,8 @@ fn build_velocyto_matrices(
         .map(|&(lo, hi)| {
             let cb = recs[lo].cb;
             // gene → umi → (resolved category, read count)
-            let mut gene_umi: HashMap<u32, HashMap<u64, (VelocytoCategory, u32)>> = HashMap::new();
+            let mut gene_umi: HashMap<u32, HashMap<u64, (VelocytoCategory, u32)>> =
+                HashMap::default();
             for &r in &recs[lo..hi] {
                 let e = gene_umi
                     .entry(r.gene)
@@ -1551,7 +1556,7 @@ fn build_velocyto_matrices(
             for &g in &genes {
                 let umis = &gene_umi[g];
                 let mut by_cat: [HashMap<u64, u32>; 3] =
-                    [HashMap::new(), HashMap::new(), HashMap::new()];
+                    [HashMap::default(), HashMap::default(), HashMap::default()];
                 for (&umi, &(cat, rc)) in umis {
                     by_cat[cat_idx(cat)].insert(umi, rc);
                 }
@@ -1894,7 +1899,7 @@ mod tests {
         assert!(em.get(&1).copied().unwrap_or(0.0).abs() < 1e-6);
 
         // With no unique evidence, PropUnique falls back to uniform.
-        let empty: HashMap<u32, f64> = HashMap::new();
+        let empty: HashMap<u32, f64> = HashMap::default();
         let pu0 = distribute_multi(MultiMethod::PropUnique, &empty, &mols);
         assert!((pu0[&0] - 0.5).abs() < 1e-9 && (pu0[&1] - 0.5).abs() < 1e-9);
     }
@@ -2036,14 +2041,14 @@ mod tests {
     #[test]
     fn multi_gene_umi_cr_keeps_top_gene() {
         // UMI maps to gene 0 (3 reads) and gene 1 (1 read). CR keeps only gene 0.
-        let mut genes = HashMap::new();
+        let mut genes = HashMap::default();
         genes.insert(0u32, 3u32);
         genes.insert(1u32, 1u32);
         let kept = filter_multi_gene_umi(&genes, UmiFiltering::MultiGeneUmiCr);
         assert_eq!(kept.len(), 1);
         assert_eq!(*kept[0].0, 0);
         // Plain MultiGeneUMI with all-singletons drops the UMI entirely.
-        let mut single = HashMap::new();
+        let mut single = HashMap::default();
         single.insert(0u32, 1u32);
         single.insert(1u32, 1u32);
         assert_eq!(
