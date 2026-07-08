@@ -43,6 +43,14 @@ pub struct GeneAnnotation {
     /// aligned block lies wholly within an exon (mature/ambiguous) or extends
     /// into an intron (nascent/unspliced).
     pub gene_exons: Vec<Vec<(u64, u64)>>,
+    /// Max-end segment tree per chromosome, parallel to `chr_exons`, enabling an
+    /// O(log n + k) overlap query instead of the old O(n) linear scan (the #1
+    /// solo hotspot: gene assignment runs per read, twice for `GeneFull`). Each
+    /// entry is a flat binary max-tree over the sorted exon list's end
+    /// coordinates; see [`GeneAnnotation::build_maxend_seg`].
+    chr_exons_seg: Vec<Vec<u64>>,
+    /// Max-end segment tree per chromosome, parallel to `chr_gene_body`.
+    chr_gene_body_seg: Vec<Vec<u64>>,
 }
 
 impl GeneAnnotation {
@@ -142,13 +150,48 @@ impl GeneAnnotation {
             *ex = merged;
         }
 
+        // Max-end segment trees over the now-sorted interval lists (built once
+        // at index time) drive the fast overlap query.
+        let chr_exons_seg = chr_exons
+            .iter()
+            .map(|iv| Self::build_maxend_seg(iv))
+            .collect();
+        let chr_gene_body_seg = chr_gene_body
+            .iter()
+            .map(|iv| Self::build_maxend_seg(iv))
+            .collect();
+
         GeneAnnotation {
             gene_ids,
             gene_is_reverse,
             chr_exons,
             chr_gene_body,
             gene_exons,
+            chr_exons_seg,
+            chr_gene_body_seg,
         }
+    }
+
+    /// Build a flat binary max-tree over the end coordinates of a sorted-by-start
+    /// interval list. `seg[1]` is the root; children of `k` are `2k`/`2k+1`; the
+    /// `i`-th leaf (`seg[sz + i]`) holds `iv[i].end`, with `sz` the next power of
+    /// two ≥ `iv.len()` and padding leaves set to 0. `seg.len() == 2 * sz`. Empty
+    /// list → empty tree. Enables pruning any subtree whose max end ≤ a query's
+    /// read start during the overlap traversal.
+    fn build_maxend_seg(iv: &[(u64, u64, usize)]) -> Vec<u64> {
+        let n = iv.len();
+        if n == 0 {
+            return Vec::new();
+        }
+        let sz = n.next_power_of_two();
+        let mut seg = vec![0u64; 2 * sz];
+        for (i, &(_, e, _)) in iv.iter().enumerate() {
+            seg[sz + i] = e;
+        }
+        for node in (1..sz).rev() {
+            seg[node] = seg[2 * node].max(seg[2 * node + 1]);
+        }
+        seg
     }
 
     /// Whether the aligned block `[start, end)` lies wholly within a single
@@ -191,18 +234,34 @@ impl GeneAnnotation {
     /// `overlapping_genes` into a caller-provided buffer (cleared + sorted/deduped
     /// here). Lets the per-read hot path reuse one scratch `Vec` across reads.
     pub fn overlapping_genes_into(&self, transcript: &Transcript, out: &mut Vec<usize>) {
-        Self::overlapping_in_into(&self.chr_exons, transcript, out);
+        Self::overlapping_in_into(&self.chr_exons, &self.chr_exons_seg, transcript, out);
     }
 
     /// `overlapping_genes_full` into a caller-provided buffer.
     pub fn overlapping_genes_full_into(&self, transcript: &Transcript, out: &mut Vec<usize>) {
-        Self::overlapping_in_into(&self.chr_gene_body, transcript, out);
+        Self::overlapping_in_into(
+            &self.chr_gene_body,
+            &self.chr_gene_body_seg,
+            transcript,
+            out,
+        );
     }
 
     /// Shared overlap query over a sorted-by-start per-chromosome interval list,
     /// writing sorted/deduped gene indices into `out` (which is cleared first).
+    ///
+    /// Intervals are sorted by start, so all candidates for an exon `[rs, re)`
+    /// live in `chr[..upper]` where `upper` is the first interval with
+    /// `start >= re` (a binary search). The old code then scanned all of
+    /// `chr[..upper]` — O(number of genes before the read) per exon, which for a
+    /// read late on a chromosome is nearly the whole chromosome. Here we instead
+    /// walk the max-end segment tree, pruning any subtree whose maximum end is
+    /// `<= rs` (nothing there can overlap) or that lies entirely at/after `upper`,
+    /// so only genuinely-overlapping leaves are visited: O(log n + k). Same set
+    /// of genes, same sort/dedup — output is identical to the linear scan.
     fn overlapping_in_into(
         chr_intervals: &[Vec<(u64, u64, usize)>],
+        chr_segs: &[Vec<u64>],
         transcript: &Transcript,
         out: &mut Vec<usize>,
     ) {
@@ -214,6 +273,8 @@ impl GeneAnnotation {
         if chr.is_empty() {
             return;
         }
+        let seg = &chr_segs[transcript.chr_idx];
+        let sz = seg.len() / 2; // number of leaves (power of two)
 
         for exon in &transcript.exons {
             let rs = exon.genome_start;
@@ -221,13 +282,34 @@ impl GeneAnnotation {
             if re <= rs {
                 continue;
             }
-            // All intervals with start < re are candidates.
             let upper = chr.partition_point(|&(gs, _, _)| gs < re);
-            for &(_, ge, gene_idx) in &chr[..upper] {
-                // Overlap condition: ge > rs (start already guaranteed < re by upper bound).
-                if ge > rs {
-                    out.push(gene_idx);
+            if upper == 0 {
+                continue;
+            }
+            // Explicit-stack DFS over the segment tree. Depth is bounded by the
+            // tree height (log2 sz), so a fixed 64-slot stack never overflows for
+            // any realistic chromosome (sz up to 2^31).
+            let mut stack: [(usize, usize, usize); 64] = [(0, 0, 0); 64];
+            let mut sp = 0usize;
+            stack[sp] = (1, 0, sz);
+            sp += 1;
+            while sp > 0 {
+                sp -= 1;
+                let (node, nlo, nhi) = stack[sp];
+                // Prune: entirely at/after `upper` (start >= re), or no end > rs.
+                if nlo >= upper || seg[node] <= rs {
+                    continue;
                 }
+                if nhi - nlo == 1 {
+                    // Leaf: nlo < upper (start < re) and its end > rs → overlap.
+                    out.push(chr[nlo].2);
+                    continue;
+                }
+                let mid = (nlo + nhi) >> 1;
+                stack[sp] = (2 * node, nlo, mid);
+                sp += 1;
+                stack[sp] = (2 * node + 1, mid, nhi);
+                sp += 1;
             }
         }
 
@@ -532,6 +614,132 @@ mod tests {
             junction_motifs: vec![],
             junction_annotated: vec![],
             read_seq: vec![],
+        }
+    }
+
+    /// The segment-tree overlap query must return exactly the same gene set as a
+    /// brute-force linear overlap scan — for random multi-exon genes AND random
+    /// multi-exon query transcripts, on both the exon (`Gene`) and gene-body
+    /// (`GeneFull`) interval lists. This is the correctness contract for the
+    /// O(log n) rewrite: same output as the old O(n) scan, always.
+    #[test]
+    fn overlap_query_matches_bruteforce_fuzz() {
+        struct R(u64);
+        impl R {
+            fn next(&mut self) -> u64 {
+                let mut x = self.0;
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                self.0 = x;
+                x
+            }
+            fn upto(&mut self, m: u64) -> u64 {
+                self.next() % m
+            }
+        }
+        let mut r = R(0x1234_5678_9abc_def0);
+        let chr_len = 1_000_000u64;
+        let genome = Genome {
+            sequence: vec![0u8; (2 * chr_len) as usize].into(),
+            n_genome: chr_len,
+            n_genome_real: chr_len,
+            n_chr_real: 1,
+            chr_start: vec![0, chr_len],
+            chr_length: vec![chr_len],
+            chr_name: vec!["chr1".to_string()],
+        };
+
+        // 400 random genes, each 1–5 exons, scattered across the chromosome.
+        let mut exons = Vec::new();
+        for g in 0..400u32 {
+            let n_ex = 1 + r.upto(5);
+            let mut pos = r.upto(chr_len - 40_000);
+            for _ in 0..n_ex {
+                let s = pos + r.upto(1000);
+                let e = s + 50 + r.upto(2000);
+                if e >= chr_len {
+                    break;
+                }
+                let strand = if r.upto(2) == 0 { '+' } else { '-' };
+                exons.push(make_gtf_exon("chr1", s + 1, e, strand, &format!("G{g}")));
+                pos = e + r.upto(3000);
+                if pos >= chr_len {
+                    break;
+                }
+            }
+        }
+        let ann = GeneAnnotation::from_gtf_exons(&exons, &genome);
+
+        // Brute-force overlap over a pub interval list (start < re && end > rs).
+        fn naive(iv: &[(u64, u64, usize)], t: &Transcript) -> Vec<usize> {
+            let mut o = Vec::new();
+            for ex in &t.exons {
+                let (rs, re) = (ex.genome_start, ex.genome_end);
+                if re <= rs {
+                    continue;
+                }
+                for &(gs, ge, g) in iv {
+                    if gs < re && ge > rs {
+                        o.push(g);
+                    }
+                }
+            }
+            o.sort_unstable();
+            o.dedup();
+            o
+        }
+
+        for _ in 0..3000 {
+            let n_ex = 1 + r.upto(3);
+            let mut t_exons = Vec::new();
+            let mut pos = r.upto(chr_len);
+            for _ in 0..n_ex {
+                let s = (pos + r.upto(500)).min(chr_len - 1);
+                let e = (s + 50 + r.upto(300)).min(chr_len);
+                if e <= s {
+                    break;
+                }
+                t_exons.push(Exon {
+                    genome_start: s,
+                    genome_end: e,
+                    read_start: 0,
+                    read_end: (e - s) as usize,
+                    i_frag: 0,
+                });
+                pos = e + r.upto(2000);
+                if pos >= chr_len {
+                    break;
+                }
+            }
+            if t_exons.is_empty() {
+                continue;
+            }
+            let t = Transcript {
+                chr_idx: 0,
+                genome_start: t_exons[0].genome_start,
+                genome_end: t_exons.last().unwrap().genome_end,
+                is_reverse: false,
+                exons: t_exons,
+                cigar: vec![],
+                score: 100,
+                n_mismatch: 0,
+                n_gap: 0,
+                n_junction: 0,
+                junction_motifs: vec![],
+                junction_annotated: vec![],
+                read_seq: vec![],
+            };
+            assert_eq!(
+                ann.overlapping_genes(&t),
+                naive(&ann.chr_exons[0], &t),
+                "Gene overlap query != brute force"
+            );
+            assert_eq!(
+                ann.overlapping_genes_full(&t),
+                naive(&ann.chr_gene_body[0], &t),
+                "GeneFull overlap query != brute force"
+            );
         }
     }
 
