@@ -20,7 +20,7 @@ use std::path::PathBuf;
 /// LCG pseudo-random sequence generator (same recurrence as
 /// `tests/alignment_features.rs`, so genome layout stays comprehensible).
 fn lcg_seq(seed: u32, length: usize) -> Vec<u8> {
-    let bases: [u8; 4] = [b'A', b'C', b'G', b'T'];
+    let bases: [u8; 4] = *b"ACGT";
     let mut state = seed;
     let mut seq = Vec::with_capacity(length);
     for _ in 0..length {
@@ -132,7 +132,7 @@ fn write_reads(
             let n_mm = rng.next_range(3); // 0, 1, or 2 mismatches
             for _ in 0..n_mm {
                 let pos = rng.next_range(read_len);
-                let bases = [b'A', b'C', b'G', b'T'];
+                let bases = *b"ACGT";
                 s[pos] = bases[rng.next_range(4)];
             }
             s
@@ -158,7 +158,7 @@ fn write_reads(
             chr2[start..start + read_len].to_vec()
         } else {
             // Pure random noise — exercises the "no seed found" / unmapped path.
-            let bases = [b'A', b'C', b'G', b'T'];
+            let bases = *b"ACGT";
             (0..read_len).map(|_| bases[rng.next_range(4)]).collect()
         };
 
