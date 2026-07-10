@@ -141,6 +141,12 @@ Benchmarked on 10,000 yeast RNA-seq reads (150 bp, ERR12389696), compared to STA
 
 ## Performance & Benchmarks
 
+Two single-cell benchmarks: a **mouse** three-way against STARsolo and CellRanger
+(throughput on a compute-bound run), and a **human** run that is memory-bound,
+where the sparse suffix array is the deciding factor.
+
+### Mouse — 5k PBMC, three-way vs STARsolo and CellRanger
+
 Single-cell (STARsolo) throughput and memory, benchmarked native x86_64 against
 **STARsolo 2.7.11b** and **CellRanger 10.0.0** on a real 10x dataset
 (`5k_Mouse_PBMCs_5p_gem-x_GEX`, 5′ GEM-X, GRCm39-2024-A reference). All three
@@ -170,6 +176,33 @@ CellRanger is x86-only and STAR can't run natively on Apple Silicon. Harness:
   measured a **further ~14% reduction in rustar's solo wall time (→ ~105 s)** on
   the same dataset/instance — the table above predates it and is a conservative
   floor. Count matrices are unchanged.
+
+### Human — GRCh38, memory-bound (sparse vs dense index)
+
+A full human snRNA-seq sample (GSE163577 `SRR13278444`, ~155M reads, 10x 3′ v3,
+GRCh38) hits a different bottleneck. The **32 GB dense index does not stay
+resident in 48 GB RAM**, so the run is dominated by page faults rather than
+alignment — a production dense run took **9.5 h with 558M page faults** (≈4 h of
+it kernel time). The **sparse suffix array (`--genomeSAsparseD 2`)** shrinks the
+index to **16 GB** so it fits in RAM. Measured on a 500k-read subset of the same
+sample (8 threads, warm cache):
+
+| rustar-aligner (500k subset) | Wall | Page faults | Unique mapping |
+|------------------------------|------|-------------|----------------|
+| dense index (32 GB)          | 165–460 s\* | 5.1 M | 77.0% |
+| `--genomeSAsparseD 2` (16 GB) | **54 s** | **0.32 M** | 77.6% |
+
+<sub>\*dense wall swings with cache pressure because the 32 GB index can't stay
+resident; the 16 GB sparse index is stable at ~54 s.</sub>
+
+- **~3× faster resident, up to ~8× when the dense index is paging**, with **16×
+  fewer page faults** — purely because 16 GB fits in 48 GB RAM and 32 GB does not.
+- **Sensitivity is equal** (sparse 77.6% vs dense 77.0% unique). Sparse output is
+  byte-identical to STAR's own **D=2** SA (not to a dense D=1 run), so counts
+  differ from a dense run by ~1% of matrix entries — run a whole cohort on one
+  index for consistency.
+- **Takeaway**: on a RAM-constrained box, index size — not raw aligner speed — is
+  the dominant cost for a human genome; `--genomeSAsparseD 2` is the lever.
 
 ## Supported Features
 
