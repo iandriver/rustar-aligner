@@ -303,6 +303,82 @@ pub fn open_reader(params: &Parameters) -> Result<SoloReadReader, Error> {
     SoloReadReader::open(cdna, barcode, layout, params.read_files_command.as_deref())
 }
 
+/// One paired-end solo read for `--soloBarcodeMate 1` (5' 10x): both mates carry
+/// cDNA, and the cell barcode (CB+UMI) is a prefix of mate 1.
+pub struct SoloPairedRead {
+    pub mate1: EncodedRead,
+    pub mate2: EncodedRead,
+    /// `None` when mate 1 was too short to extract CB+UMI.
+    pub barcode: Option<CellBarcode>,
+}
+
+/// Reads the two cDNA mate files in lockstep for a `--soloBarcodeMate 1` run,
+/// extracting the barcode from the start of mate 1.
+pub struct SoloPairedReader {
+    mate1: FastqReader,
+    mate2: FastqReader,
+    layout: SoloBarcodeLayout,
+}
+
+impl SoloPairedReader {
+    pub fn open(
+        mate1_path: &Path,
+        mate2_path: &Path,
+        layout: SoloBarcodeLayout,
+        decompress_cmd: Option<&str>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
+            mate1: FastqReader::open(mate1_path, decompress_cmd)?,
+            mate2: FastqReader::open(mate2_path, decompress_cmd)?,
+            layout,
+        })
+    }
+
+    /// Fetch the next (mate1, mate2) pair with the barcode extracted from mate 1.
+    pub fn next_read(&mut self) -> Result<Option<SoloPairedRead>, Error> {
+        match (self.mate1.next_encoded()?, self.mate2.next_encoded()?) {
+            (Some(mate1), Some(mate2)) => {
+                let barcode = self.layout.extract(&mate1);
+                Ok(Some(SoloPairedRead {
+                    mate1,
+                    mate2,
+                    barcode,
+                }))
+            }
+            (None, None) => Ok(None),
+            _ => Err(Error::from(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "solo: mate 1 and mate 2 read files have different lengths",
+            ))),
+        }
+    }
+
+    /// Read up to `batch_size` pairs for parallel processing.
+    pub fn read_batch(&mut self, batch_size: usize) -> Result<Vec<SoloPairedRead>, Error> {
+        let mut batch = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
+            match self.next_read()? {
+                Some(read) => batch.push(read),
+                None => break,
+            }
+        }
+        Ok(batch)
+    }
+}
+
+/// Build a [`SoloPairedReader`] for `--soloBarcodeMate 1`, resolving the two cDNA
+/// mate files from `--readFilesIn`.
+pub fn open_paired_reader(params: &Parameters) -> Result<SoloPairedReader, Error> {
+    let (mate1, mate2) = params.solo_cdna_mate_files().ok_or_else(|| {
+        Error::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "solo: --soloBarcodeMate 1 requires two --readFilesIn cDNA mate files",
+        ))
+    })?;
+    let layout = SoloBarcodeLayout::from_params(params);
+    SoloPairedReader::open(mate1, mate2, layout, params.read_files_command.as_deref())
+}
+
 // ---------------------------------------------------------------------------
 // CellRanger4 adapter clipping (--clipAdapterType CellRanger4)
 // ---------------------------------------------------------------------------
@@ -623,6 +699,7 @@ impl SoloContext {
     pub fn process_read(
         &self,
         cdna_transcripts: &[Transcript],
+        n_loci: usize,
         barcode: Option<&CellBarcode>,
         junctions: &[(u64, u64)],
     ) -> SoloReadOutcome {
@@ -645,8 +722,9 @@ impl SoloContext {
 
         // Mapping funnel: count uniquely-mapped reads by region (CellRanger's
         // "confidently mapped" = MAPQ 255 ≈ a single alignment), independent of
-        // barcode validity.
-        if cdna_transcripts.len() == 1 {
+        // barcode validity. `n_loci` is the number of genomic loci the read (or
+        // pair) maps to — for SE this equals `cdna_transcripts.len()`.
+        if n_loci == 1 {
             match class.region {
                 Some(Region::Exonic) => {
                     self.region_stats.exonic.fetch_add(1, Ordering::Relaxed);
@@ -777,6 +855,33 @@ impl SoloContext {
             .collect();
         out
     }
+
+    /// Process one 5' paired-end solo read (`--soloBarcodeMate 1`): the barcode is
+    /// from mate 1, and both mates align as a pair. Genes are assigned from the
+    /// union of both mates evaluated against the pair's (mate 1's) transcription
+    /// strand — matching STAR's PE quantification (cf. [`crate::quant`]'s
+    /// `count_pe_read`). Each aligned pair counts as one locus.
+    ///
+    /// `pairs` are the `(mate1, mate2)` transcripts of every BothMapped pair (>1
+    /// pair ⇒ multimapper). `junctions` are the pair's crossed junctions.
+    pub fn process_read_pe(
+        &self,
+        pairs: &[(&Transcript, &Transcript)],
+        barcode: Option<&CellBarcode>,
+        junctions: &[(u64, u64)],
+    ) -> SoloReadOutcome {
+        // Effective transcripts: give both mates of a pair the pair's strand
+        // (mate 1's), so `classify_read`'s per-transcript strand filter treats them
+        // as one stranded observation. Genomic overlap is unaffected by is_reverse.
+        let mut eff: Vec<Transcript> = Vec::with_capacity(pairs.len() * 2);
+        for (m1, m2) in pairs {
+            let mut m2c = (*m2).clone();
+            m2c.is_reverse = m1.is_reverse;
+            eff.push((*m1).clone());
+            eff.push(m2c);
+        }
+        self.process_read(&eff, pairs.len(), barcode, junctions)
+    }
 }
 
 #[cfg(test)]
@@ -881,6 +986,26 @@ mod tests {
         let layout = v2_layout();
         let read = encoded_read("short", "AAAAAAAACCCC", "IIIIIIIIIIII");
         assert!(layout.extract(&read).is_none());
+    }
+
+    #[test]
+    fn extract_barcode_from_mate1_with_cdna_tail() {
+        // `--soloBarcodeMate 1`: mate 1 = [CB+UMI][cDNA]. The barcode is read from
+        // the fixed prefix; the trailing cDNA is ignored (same CB/UMI as a
+        // barcode-only read).
+        let layout = v2_layout();
+        let prefix = "AAAAAAAACCCCCCCCGGGGGTTTTT"; // 16 CB + 10 UMI
+        let tail = "TTTTGGGGCCCCAAAATTTTGGGG"; // 24 bp of cDNA
+        let read = encoded_read(
+            "m1",
+            &format!("{prefix}{tail}"),
+            &"I".repeat(prefix.len() + tail.len()),
+        );
+        let bc = layout
+            .extract(&read)
+            .expect("should extract despite cDNA tail");
+        assert_eq!(bc.cb_string(), "AAAAAAAACCCCCCCC");
+        assert_eq!(bc.umi_string(), "GGGGGTTTTT");
     }
 
     #[test]

@@ -350,13 +350,15 @@ pub struct Parameters {
     #[arg(long = "readMapNumber", default_value_t = -1, allow_hyphen_values = true)]
     pub read_map_number: i64,
 
-    /// Bases to clip from 5' end of each mate
-    #[arg(long = "clip5pNbases", default_value_t = 0)]
-    pub clip5p_nbases: u32,
+    /// Bases to clip from the 5' end of each mate. One value applies to both
+    /// mates; two values are per-mate (mate 1, then mate 2).
+    #[arg(long = "clip5pNbases", num_args = 1..=2, default_values_t = vec![0u32])]
+    pub clip5p_nbases: Vec<u32>,
 
-    /// Bases to clip from 3' end of each mate
-    #[arg(long = "clip3pNbases", default_value_t = 0)]
-    pub clip3p_nbases: u32,
+    /// Bases to clip from the 3' end of each mate. One value applies to both
+    /// mates; two values are per-mate (mate 1, then mate 2).
+    #[arg(long = "clip3pNbases", num_args = 1..=2, default_values_t = vec![0u32])]
+    pub clip3p_nbases: Vec<u32>,
 
     /// Adapter clipping type applied to the cDNA read: `Hamming` (default,
     /// adapter-sequence based, no-op when no adapter is configured) or
@@ -755,6 +757,24 @@ pub struct Parameters {
     #[arg(long = "soloUMIlen", default_value_t = 10)]
     pub solo_umi_len: u32,
 
+    /// Which mate carries the barcode (CB+UMI): 0 = a separate barcode read
+    /// (default, 3' 10x); 1 = the barcode is a prefix of mate 1, which also
+    /// carries cDNA (5' 10x, paired-end — both mates are aligned). 2 is not yet
+    /// supported.
+    #[arg(long = "soloBarcodeMate", default_value_t = 0)]
+    pub solo_barcode_mate: u32,
+
+    /// Barcode-read length check: 1 = require the barcode read length to equal
+    /// soloCBlen + soloUMIlen; 0 = do not check (needed when the barcode read is
+    /// longer, e.g. the 5' mate-1 read that continues into cDNA).
+    #[arg(long = "soloBarcodeReadLength", default_value_t = 1)]
+    pub solo_barcode_read_length: i64,
+
+    /// Accepted for STAR-command compatibility; rustar always mmaps the index, so
+    /// STAR's shared-memory genome-loading modes are a no-op here.
+    #[arg(long = "genomeLoad", default_value = "NoSharedMemory")]
+    pub genome_load: String,
+
     /// `CB_UMI_Complex` cell-barcode segment positions, one per segment, as
     /// `startAnchor_startDist_endAnchor_endDist`. Only read-start anchoring
     /// (`anchor = 0`, fixed positions) is supported, e.g. `0_0_0_7 0_8_0_15`.
@@ -1140,6 +1160,27 @@ impl Parameters {
                     ),
                 ));
             }
+            // soloBarcodeMate: 0 (separate barcode read) or 1 (barcode on mate 1,
+            // 5' paired-end). Mate 2 is not yet supported.
+            match params.solo_barcode_mate {
+                0 => {}
+                1 => {
+                    if params.solo_type != SoloType::CbUmiSimple {
+                        return Err(command.error(
+                            ErrorKind::InvalidValue,
+                            "--soloBarcodeMate 1 is only supported with --soloType CB_UMI_Simple",
+                        ));
+                    }
+                }
+                other => {
+                    return Err(command.error(
+                        ErrorKind::InvalidValue,
+                        format!(
+                            "--soloBarcodeMate {other} not supported (only 0 = separate barcode read, or 1 = barcode on mate 1)"
+                        ),
+                    ));
+                }
+            }
             // Gene / GeneFull / SJ / Velocyto are implemented.
             for f in &params.solo_features {
                 if !matches!(f.as_str(), "SJ" | "Velocyto")
@@ -1310,6 +1351,34 @@ impl Parameters {
         }
     }
 
+    /// True for a 5' paired-end solo run (`--soloBarcodeMate 1`): the barcode is a
+    /// prefix of mate 1 and both `--readFilesIn` files are cDNA mates.
+    pub fn solo_barcode_on_mate1(&self) -> bool {
+        self.solo_enabled() && self.solo_barcode_mate == 1
+    }
+
+    /// The two cDNA mate files (mate 1, mate 2) for a `--soloBarcodeMate 1` run.
+    pub fn solo_cdna_mate_files(&self) -> Option<(&PathBuf, &PathBuf)> {
+        match (self.read_files_in.first(), self.read_files_in.get(1)) {
+            (Some(m1), Some(m2)) => Some((m1, m2)),
+            _ => None,
+        }
+    }
+
+    /// Bases to clip from the 5' end of `mate` (0 or 1). A single configured
+    /// value applies to both mates.
+    pub fn clip5p(&self, mate: usize) -> usize {
+        let v = &self.clip5p_nbases;
+        v[mate.min(v.len().saturating_sub(1))] as usize
+    }
+
+    /// Bases to clip from the 3' end of `mate` (0 or 1). A single configured
+    /// value applies to both mates.
+    pub fn clip3p(&self, mate: usize) -> usize {
+        let v = &self.clip3p_nbases;
+        v[mate.min(v.len().saturating_sub(1))] as usize
+    }
+
     /// True when the literal `None` whitelist was given (keep all barcodes).
     pub fn solo_cb_whitelist_none(&self) -> bool {
         self.solo_cb_whitelist.len() == 1 && self.solo_cb_whitelist[0] == "None"
@@ -1365,8 +1434,8 @@ mod tests {
         assert_eq!(p.genome_chr_bin_nbits, 18);
         assert_eq!(p.genome_sa_sparse_d, 1);
         assert_eq!(p.read_map_number, -1);
-        assert_eq!(p.clip5p_nbases, 0);
-        assert_eq!(p.clip3p_nbases, 0);
+        assert_eq!(p.clip5p(0), 0);
+        assert_eq!(p.clip3p(0), 0);
         assert_eq!(p.out_file_name_prefix, "./");
         assert_eq!(p.out_sam_type, OutSamType::default());
         assert_eq!(p.out_sam_strand_field, "None");
@@ -1509,6 +1578,60 @@ mod tests {
         assert_eq!(p.align_intron_max, 1_000_000);
         assert_eq!(p.sjdb_gtf_file, Some(PathBuf::from("gencode.gtf")));
         assert_eq!(p.twopass_mode, TwopassMode::Basic);
+    }
+
+    #[test]
+    fn clip_nbases_per_mate() {
+        // A single value applies to both mates.
+        let p = try_parse(&["--readFilesIn", "r1.fq", "r2.fq", "--clip5pNbases", "7"]).unwrap();
+        assert_eq!(p.clip5p(0), 7);
+        assert_eq!(p.clip5p(1), 7);
+        // Two values are per-mate (mate 1, mate 2).
+        let p = try_parse(&[
+            "--readFilesIn",
+            "r1.fq",
+            "r2.fq",
+            "--clip5pNbases",
+            "39",
+            "0",
+            "--clip3pNbases",
+            "1",
+            "2",
+        ])
+        .unwrap();
+        assert_eq!((p.clip5p(0), p.clip5p(1)), (39, 0));
+        assert_eq!((p.clip3p(0), p.clip3p(1)), (1, 2));
+    }
+
+    #[test]
+    fn solo_barcode_mate_validation() {
+        let with_mate = |mate: &str| {
+            try_parse(&[
+                "--readFilesIn",
+                "R1.fq",
+                "R2.fq",
+                "--soloType",
+                "CB_UMI_Simple",
+                "--soloCBwhitelist",
+                "None",
+                "--soloCBmatchWLtype",
+                "Exact",
+                "--sjdbGTFfile",
+                "g.gtf",
+                "--soloFeatures",
+                "Gene",
+                "--soloBarcodeMate",
+                mate,
+            ])
+        };
+        // Mate 1 (5' paired-end) is accepted; the helper reports it.
+        let p = with_mate("1").unwrap();
+        assert!(p.solo_barcode_on_mate1());
+        // Mate 0 (default) is the standard SE-solo path.
+        assert!(!with_mate("0").unwrap().solo_barcode_on_mate1());
+        // Mate 2 is rejected with a clear message.
+        let err = with_mate("2").unwrap_err().to_string();
+        assert!(err.contains("soloBarcodeMate"), "unexpected error: {err}");
     }
 
     #[test]

@@ -24,6 +24,9 @@ docker run --rm -v "$PWD":/work -w /work -e CARGO_TARGET_DIR=/work/target-linux 
   STARBIN=$(which STAR)
   for i in $(seq 1 '"$RUNS"'); do
     echo "===== differential run $i ====="
+    echo "--- 3'\'' SE (CellRanger-style) ---"
     python3 test/solo_cellranger_diff.py --star "$STARBIN" --rustar "$RUSTAR"
+    echo "--- 5'\'' PE (--soloBarcodeMate 1) ---"
+    python3 test/solo_5p_diff.py --star "$STARBIN" --rustar "$RUSTAR"
   done
 '
