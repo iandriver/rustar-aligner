@@ -1255,6 +1255,89 @@ fn called_cells(cells: &[CellStat], filter: &[String]) -> Option<Vec<u32>> {
     Some(cbs)
 }
 
+/// The ambient gene probabilities an EmptyDrops candidate is tested against.
+///
+/// Smoothed by Simple Good-Turing, as STAR does
+/// (`SoloFeature_emptyDrops_CR.cpp`). The raw ambient counts are a small sample
+/// — a gene seen twice there is not twice as likely as one seen once — so SGT
+/// fits the frequency spectrum and reserves mass for genes the sample missed.
+///
+/// The species that mass is reserved for are the genes this dataset detects
+/// *somewhere*, not every gene in the annotation. STAR subtracts the
+/// never-detected genes from the zero-frequency count
+/// (`ambCountFreq[0] -= (featuresNumber-featDetN)`) and then assigns a
+/// probability only to genes in `featDet`:
+///
+/// ```text
+/// for (uint32 ig=0; ig<featuresNumber; ig++) {
+///     if (featDet.count(ig)>0) {
+///         ambProfileLogP[ig]=ambCountFreqSGT[ambCount[ig]];
+///     };
+/// };
+/// ```
+///
+/// so a gene expressed nowhere keeps the initial `0.0` and is left out of the
+/// simulated draws, which take the `cf>0` subset. Counting those genes as
+/// species would both dilute the reserved mass across them and spend simulated
+/// UMIs on an outcome no candidate can have.
+fn ambient_profile(ambient: &[f64], detected_anywhere: &[bool], amb_total: f64) -> Vec<f64> {
+    let n_features = ambient.len();
+    // Frequency of frequencies over the integer ambient counts.
+    let counts: Vec<u32> = ambient.iter().map(|&x| x as u32).collect();
+    let mut fof: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
+    for &c in &counts {
+        *fof.entry(c).or_insert(0) += 1;
+    }
+    // Genes detected somewhere but absent from the ambient sample: these are
+    // the species Good-Turing reserves its unseen mass for.
+    let n_zero = (0..n_features)
+        .filter(|&g| detected_anywhere[g] && counts[g] == 0)
+        .count() as u32;
+
+    let mut sgt = crate::solo::sgt::Sgt::new();
+    for (&freq, &n) in &fof {
+        if freq != 0 {
+            sgt.add(freq, n);
+        }
+    }
+    let fitted = sgt.analyse();
+
+    // Per-gene probability. A detected gene absent from the ambient set shares
+    // the reserved unseen mass; one present takes its smoothed estimate. When
+    // the spectrum is too small to fit (D17), there is no reserved mass and the
+    // raw proportions are all that is left.
+    let unseen_each = if n_zero > 0 {
+        sgt.pzero() / f64::from(n_zero)
+    } else {
+        0.0
+    };
+    let raw: Vec<f64> = counts
+        .iter()
+        .enumerate()
+        .map(|(g, &c)| {
+            if c == 0 {
+                if detected_anywhere[g] {
+                    unseen_each
+                } else {
+                    0.0
+                }
+            } else if fitted {
+                sgt.estimate(c).unwrap_or(f64::from(c) / amb_total)
+            } else {
+                f64::from(c) / amb_total
+            }
+        })
+        .collect();
+    // Renormalise: the smoothed estimates are per-event probabilities and only
+    // sum to one over the whole spectrum, not over this gene set.
+    let total: f64 = raw.iter().sum();
+    if total > 0.0 {
+        raw.into_iter().map(|p| p / total).collect()
+    } else {
+        raw
+    }
+}
+
 /// `--soloCellFilter EmptyDrops_CR`: the CR2.2-knee guaranteed cells PLUS cells
 /// rescued by the EmptyDrops multinomial Monte-Carlo test (STAR
 /// `SoloFeature_emptyDrops_CR.cpp`). Per-cell gene profiles for the ambient +
@@ -1313,6 +1396,12 @@ fn emptydrops_called(
 
     // Re-read the raw body for ambient (summed) + per-candidate profiles.
     let mut ambient = vec![0f64; n_features];
+    // STAR counts the Good-Turing "unseen" species over the genes this dataset
+    // detects at all, not over every gene in the annotation
+    // (`SoloFeature_emptyDrops_CR.cpp`: `featDet` is built over all `nCB` cells,
+    // and `ambCountFreq[0] -= (featuresNumber-featDetN)`). A gene expressed
+    // nowhere is not a species the ambient sample could have missed.
+    let mut detected_anywhere = vec![false; n_features];
     let mut amb_total = 0f64;
     let mut cand_profiles: HashMap<u32, Vec<(u32, u32)>> = HashMap::default();
     let reader =
@@ -1326,6 +1415,9 @@ fn emptydrops_called(
         let g = gt.parse::<u32>().unwrap_or(1) - 1;
         let cb = ct.parse::<u32>().unwrap_or(1) - 1;
         let v = vt.parse::<u32>().unwrap_or(0);
+        if v > 0 {
+            detected_anywhere[g as usize] = true;
+        }
         if ambient_set.contains(&cb) {
             ambient[g as usize] += v as f64;
             amb_total += v as f64;
@@ -1346,53 +1438,7 @@ fn emptydrops_called(
     // entirely. The previous approximation here reserved mass from the
     // singleton rate alone and spread the rest in proportion to raw counts,
     // which is the right shape but the wrong numbers.
-    let amb_p: Vec<f64> = {
-        // Frequency of frequencies over the integer ambient counts.
-        let counts: Vec<u32> = ambient.iter().map(|&x| x as u32).collect();
-        let mut fof: std::collections::BTreeMap<u32, u32> = std::collections::BTreeMap::new();
-        for &c in &counts {
-            *fof.entry(c).or_insert(0) += 1;
-        }
-        let n_zero = fof.get(&0).copied().unwrap_or(0);
-
-        let mut sgt = crate::solo::sgt::Sgt::new();
-        for (&freq, &n) in &fof {
-            if freq != 0 {
-                sgt.add(freq, n);
-            }
-        }
-        let fitted = sgt.analyse();
-
-        // Per-gene probability. A gene absent from the ambient set shares the
-        // reserved unseen mass; one present takes its smoothed estimate. When
-        // the spectrum is too small to fit (D17), there is no reserved mass and
-        // the raw proportions are all that is left.
-        let unseen_each = if n_zero > 0 {
-            sgt.pzero() / f64::from(n_zero)
-        } else {
-            0.0
-        };
-        let raw: Vec<f64> = counts
-            .iter()
-            .map(|&c| {
-                if c == 0 {
-                    unseen_each
-                } else if fitted {
-                    sgt.estimate(c).unwrap_or(f64::from(c) / amb_total)
-                } else {
-                    f64::from(c) / amb_total
-                }
-            })
-            .collect();
-        // Renormalise: the smoothed estimates are per-event probabilities and
-        // only sum to one over the whole spectrum, not over this gene set.
-        let total: f64 = raw.iter().sum();
-        if total > 0.0 {
-            raw.into_iter().map(|p| p / total).collect()
-        } else {
-            raw
-        }
-    };
+    let amb_p = ambient_profile(&ambient, &detected_anywhere, amb_total);
     let amb_logp: Vec<f64> = amb_p.iter().map(|&p| p.max(1e-300).ln()).collect();
 
     // Observed multinomial log-prob per candidate.
@@ -2850,6 +2896,82 @@ fn open_maybe_gz(path: &Path) -> Result<Box<dyn BufRead>, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An ambient sample with a realistic frequency spectrum, so Simple
+    /// Good-Turing has enough points to fit: `n` genes seen once, fewer seen
+    /// twice, and so on. Returns `(ambient counts, detected_anywhere)` with
+    /// `n_zero_detected` genes detected elsewhere but absent from ambient, and
+    /// `n_phantom` genes expressed nowhere at all.
+    fn spectrum(n_zero_detected: usize, n_phantom: usize) -> (Vec<f64>, Vec<bool>) {
+        let mut ambient: Vec<f64> = Vec::new();
+        for (freq, n) in [
+            (1u32, 500usize),
+            (2, 200),
+            (3, 100),
+            (4, 50),
+            (5, 20),
+            (6, 10),
+        ] {
+            ambient.extend(std::iter::repeat_n(f64::from(freq), n));
+        }
+        let mut detected = vec![true; ambient.len()];
+        ambient.extend(std::iter::repeat_n(0.0, n_zero_detected));
+        detected.extend(std::iter::repeat_n(true, n_zero_detected));
+        ambient.extend(std::iter::repeat_n(0.0, n_phantom));
+        detected.extend(std::iter::repeat_n(false, n_phantom));
+        (ambient, detected)
+    }
+
+    /// STAR reserves the Good-Turing unseen mass for genes this dataset detects
+    /// somewhere, and leaves a gene expressed nowhere at zero — it cannot occur
+    /// in a candidate profile, and letting it be drawn would spend simulated
+    /// UMIs on an impossible outcome.
+    #[test]
+    fn ambient_profile_excludes_never_detected_genes() {
+        let (ambient, detected) = spectrum(50, 200);
+        let total: f64 = ambient.iter().sum();
+        let p = ambient_profile(&ambient, &detected, total);
+
+        let n_seen = 880; // 500+200+100+50+20+10
+        assert!(
+            p[..n_seen].iter().all(|&x| x > 0.0),
+            "every gene with ambient counts needs a probability"
+        );
+        assert!(
+            p[n_seen..n_seen + 50].iter().all(|&x| x > 0.0),
+            "a detected gene missing from ambient must share the unseen mass"
+        );
+        assert!(
+            p[n_seen + 50..].iter().all(|&x| x == 0.0),
+            "a gene expressed nowhere must carry no probability"
+        );
+        let sum: f64 = p.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-9, "must normalise to 1, got {sum}");
+    }
+
+    /// Counting never-detected genes as species would dilute the reserved mass
+    /// across them, pushing every observed log-probability down — the bug this
+    /// guards. Adding phantom genes must change nothing.
+    #[test]
+    fn unseen_mass_is_not_diluted_by_phantom_genes() {
+        let (a_amb, a_det) = spectrum(50, 0);
+        let (b_amb, b_det) = spectrum(50, 5000);
+        let total: f64 = a_amb.iter().sum();
+        let a = ambient_profile(&a_amb, &a_det, total);
+        let b = ambient_profile(&b_amb, &b_det, total);
+
+        assert_eq!(b.len(), a.len() + 5000);
+        for (g, (&x, &y)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (x - y).abs() < 1e-12,
+                "gene {g} changed when phantom genes were added: {x} vs {y}"
+            );
+        }
+        assert!(
+            b[a.len()..].iter().all(|&x| x == 0.0),
+            "phantoms must stay at zero"
+        );
+    }
 
     /// `fmt_double` against what a C++ program printed for the same values
     /// with the default `ostream` (g++, libstdc++).

@@ -11,6 +11,18 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- `EmptyDrops_CR`: the Simple Good-Turing species universe now excludes genes
+  never detected in any cell, as STAR does. `SoloFeature_emptyDrops_CR.cpp`
+  subtracts them from the zero-frequency count
+  (`ambCountFreq[0] -= (featuresNumber-featDetN)`) and assigns a probability
+  only to genes in `featDet`, leaving the rest at zero and out of the simulated
+  draws. rustar-aligner counted every gene in the annotation, which spread the
+  reserved unseen mass over genes that can never occur and gave them a share of
+  the simulated UMIs. The ambient profile is now built by `ambient_profile()`,
+  covered by two unit tests.
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code
