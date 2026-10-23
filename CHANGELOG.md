@@ -11,6 +11,17 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Features
+
+- STARsolo now says when the barcode setup cannot be right, instead of writing
+  empty matrices and exiting successfully. A whitelist whose barcodes are a
+  different length from `--soloCBlen` is refused outright (they can never
+  match), and a run where fewer than 25% of reads carry a whitelisted barcode
+  warns, naming the layout the run selected (`--soloBarcodeMate`, and which
+  `--readFilesIn` file carries the barcode) and the three things worth checking:
+  the whitelist against the chemistry, the CB/UMI offsets against the barcode
+  read, and the order of `--readFilesIn` for that layout.
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code

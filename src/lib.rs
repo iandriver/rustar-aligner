@@ -609,6 +609,88 @@ fn align_reads(params: &Parameters) -> anyhow::Result<()> {
 /// Log STARsolo barcode/record stats and write the per-cell matrices (raw +
 /// filtered), `Summary.csv`, and the SJ feature matrix. Called from the solo
 /// branch of `run_single_pass`, where `sj_stats` is live.
+/// The share of whitelisted barcodes below which the run is worth a second look.
+///
+/// A diagnostic threshold, not a boundary between valid and invalid libraries.
+/// Across 59 CellRanger libraries the valid-barcode rate ran 87.9%..94.6%
+/// (median 92.6%), and a 10x mouse 5' GEM-X run gave 88.8% with its own
+/// whitelist against 11.87% with a list for a different chemistry. A quarter
+/// sits between those two regimes with room on both sides. A badly degraded
+/// library can legitimately fall here, which is why reaching it warns rather
+/// than fails.
+const BARCODE_MATCH_WARN_FRACTION: f64 = 0.25;
+
+/// `(matched, total, fraction)` of reads whose barcode was whitelisted, or
+/// `None` when no read was seen at all.
+///
+/// The three "yes" counts are the last of [`BarcodeStats::NAMES`]; everything
+/// before them is a reason the barcode was rejected.
+///
+/// [`BarcodeStats::NAMES`]: crate::solo::BarcodeStats::NAMES
+fn barcode_match_rate(
+    counts: &[u64; crate::solo::BarcodeStats::NAMES.len()],
+) -> Option<(u64, u64, f64)> {
+    let total: u64 = counts.iter().sum();
+    if total == 0 {
+        return None;
+    }
+    let matched: u64 = counts[crate::solo::BarcodeStats::NAMES.len() - 3..]
+        .iter()
+        .sum();
+    Some((matched, total, matched as f64 / total as f64))
+}
+
+/// Where this run expects to find the barcode, named concretely.
+///
+/// Three layouts are supported and they disagree about which file holds the
+/// barcode, so advice that names one of them is wrong for the other two.
+fn barcode_layout_hint(params: &Parameters) -> String {
+    if params.solo_barcode_on_mate1() {
+        return "--soloBarcodeMate 1, so the barcode is a prefix of mate 1 and \
+                both --readFilesIn files are cDNA; there is no separate barcode file"
+            .to_string();
+    }
+    match params.read_files_in.len() {
+        3 => "--soloBarcodeMate 0 with three --readFilesIn files, so the barcode \
+              read is the third (cDNA mate 1, cDNA mate 2, barcode)"
+            .to_string(),
+        n => format!(
+            "--soloBarcodeMate 0 with {n} --readFilesIn file(s), so the barcode \
+             read is the last (cDNA, barcode)"
+        ),
+    }
+}
+
+/// Say so when few reads carry a whitelisted barcode.
+///
+/// Nothing else notices: the run exits successfully whatever the rate, so a
+/// misconfigured geometry or the wrong whitelist surfaces only when someone
+/// reads the matrix. The advice names the layout this run actually selected,
+/// because which file holds the barcode depends on it.
+fn warn_if_barcodes_mostly_miss(
+    counts: &[u64; crate::solo::BarcodeStats::NAMES.len()],
+    params: &Parameters,
+) {
+    let Some((matched, total, frac)) = barcode_match_rate(counts) else {
+        return;
+    };
+    if frac >= BARCODE_MATCH_WARN_FRACTION {
+        return;
+    }
+    log::warn!(
+        "STARsolo: {:.2}% of {total} reads carry a whitelisted barcode \
+         ({matched} matched), so most reads will not be counted into any cell. \
+         This run reads barcodes as {}. Worth checking, in this order: that \
+         --soloCBwhitelist is the list for the chemistry that produced these \
+         reads; that --soloCBstart/--soloCBlen and --soloUMIstart/--soloUMIlen \
+         match where the barcode and UMI sit in that read; and that --readFilesIn \
+         lists the files in the order this layout expects. A degraded library can \
+         also land here, so this is a diagnostic rather than a verdict.",
+        frac * 100.0,
+        barcode_layout_hint(params)
+    );
+}
+
 fn write_solo_output(
     sctx: &std::sync::Arc<crate::solo::SoloContext>,
     params: &Parameters,
@@ -626,6 +708,7 @@ fn write_solo_output(
             .collect::<Vec<_>>()
             .join(" ")
     );
+    warn_if_barcodes_mostly_miss(&barcode_counts, params);
     for (feature, recorder) in sctx.features.iter().zip(&sctx.recorders) {
         info!(
             "STARsolo {}: collected {} resolved (CB,UMI,gene) records ({} deferred 1MM_multi)",
@@ -4359,4 +4442,47 @@ fn extract_transcript_junctions(
     }
 
     out
+}
+
+#[cfg(test)]
+mod solo_setup_tests {
+    use super::*;
+    use crate::solo::BarcodeStats;
+
+    /// Build a stats array from `(rejected_total, matched_total)`, putting the
+    /// matches in the three trailing "yes" slots.
+    fn counts(rejected: u64, matched: u64) -> [u64; BarcodeStats::NAMES.len()] {
+        let mut c = [0u64; BarcodeStats::NAMES.len()];
+        c[0] = rejected;
+        c[BarcodeStats::NAMES.len() - 3] = matched;
+        c
+    }
+
+    #[test]
+    fn barcode_match_rate_is_the_whitelisted_share() {
+        assert_eq!(barcode_match_rate(&counts(0, 0)), None, "no reads at all");
+
+        let (m, t, f) = barcode_match_rate(&counts(1, 3)).unwrap();
+        assert_eq!((m, t), (3, 4));
+        assert!((f - 0.75).abs() < 1e-12);
+
+        // The threshold sits between two measured regimes rather than marking
+        // a validity boundary. Across 59 CellRanger libraries the valid-barcode
+        // rate ran 87.9%..94.6% (median 92.6%), and a 10x mouse 5' GEM-X run
+        // gave 88.8% with its own whitelist; the same reads against a list for
+        // a different chemistry gave 11.87%. Emission itself is covered by
+        // tests/solo_setup_validation.rs, which drives the binary.
+        let worst_real = barcode_match_rate(&counts(12_100, 87_900)).unwrap().2;
+        assert!(
+            worst_real >= BARCODE_MATCH_WARN_FRACTION,
+            "the worst real library measured must not warn: {worst_real}"
+        );
+        let mouse_5p = barcode_match_rate(&counts(11_200, 88_800)).unwrap().2;
+        assert!(mouse_5p >= BARCODE_MATCH_WARN_FRACTION, "{mouse_5p}");
+        let wrong_whitelist = barcode_match_rate(&counts(176_251, 23_749)).unwrap().2;
+        assert!(
+            wrong_whitelist < BARCODE_MATCH_WARN_FRACTION,
+            "a whitelist that matches almost nothing must warn: {wrong_whitelist}"
+        );
+    }
 }

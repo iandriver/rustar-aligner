@@ -1551,6 +1551,22 @@ impl SoloContext {
                     );
                     let wl = CbWhitelist::load(&path)?;
                     log::info!("STARsolo: {} whitelist barcodes loaded", wl.len());
+                    // A whitelist whose barcodes are a different length from
+                    // `--soloCBlen` can never match one, so the run would end
+                    // with empty matrices and no other complaint. The usual
+                    // cause is a list for a different chemistry.
+                    if params.solo_type == SoloType::CbUmiSimple {
+                        let want = params.solo_cb_len as usize;
+                        let got = wl.barcode_len();
+                        if !wl.is_empty() && got != want {
+                            return Err(crate::error::Error::Parameter(format!(
+                                "whitelist {} holds {got}-base barcodes but --soloCBlen is \
+                                 {want}; they can never match. Check that the whitelist is \
+                                 the one for this chemistry.",
+                                path.display()
+                            )));
+                        }
+                    }
                     wl
                 }
                 None => CbWhitelist::NoWhitelist {
