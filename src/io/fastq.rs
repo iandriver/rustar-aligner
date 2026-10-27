@@ -1,10 +1,218 @@
 /// FASTQ reader with base encoding and decompression support
 use crate::error::Error;
 use noodles::fastq;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
+
+/// How much of a `--readFilesCommand`'s stderr is kept for the error message.
+///
+/// A decompressor's complaint is one line; this is room for many. The point of
+/// the cap is that the reader must not grow with a chatty command's output,
+/// which it would do if every byte were retained for a message that is usually
+/// never built.
+const STDERR_TAIL_CAP: usize = 8 * 1024;
+
+/// The tail of what a `--readFilesCommand` printed on stderr, written by the
+/// draining thread and read when an error message is built.
+#[derive(Default)]
+struct StderrTail {
+    /// The last [`STDERR_TAIL_CAP`] bytes seen.
+    bytes: VecDeque<u8>,
+    /// Whether anything was dropped to stay within the cap.
+    truncated: bool,
+    /// Set when the drain has seen end of input, so a reader knows the tail is
+    /// complete rather than merely current.
+    finished: bool,
+}
+
+impl StderrTail {
+    fn push(&mut self, chunk: &[u8]) {
+        self.bytes.extend(chunk.iter().copied());
+        while self.bytes.len() > STDERR_TAIL_CAP {
+            self.bytes.pop_front();
+            self.truncated = true;
+        }
+    }
+
+    /// What the command said, as far as it was kept. Lossy, because a
+    /// decompressor may print bytes that are not UTF-8 and a tail can start
+    /// mid-sequence; losing a character is better than losing the message.
+    fn message(&self) -> String {
+        let (head, rest) = self.bytes.as_slices();
+        let mut raw = Vec::with_capacity(head.len() + rest.len());
+        raw.extend_from_slice(head);
+        raw.extend_from_slice(rest);
+        let text = String::from_utf8_lossy(&raw);
+        let text = text.trim();
+        if text.is_empty() {
+            String::new()
+        } else if self.truncated {
+            format!("...{text}")
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+/// Shared between the reader and the thread draining the child's stderr.
+#[derive(Default)]
+struct StderrCapture {
+    tail: Mutex<StderrTail>,
+    /// Notified once the drain has seen end of input.
+    finished: Condvar,
+}
+
+/// A reader over a `--readFilesCommand` child's stdout that reports the child's
+/// failure instead of presenting it as an empty file.
+///
+/// Without this the failure is invisible: the child's pipe closes when it dies,
+/// the reader sees end of input, and the run continues with however many reads
+/// arrived before the command gave up — zero, if it never started. Every count
+/// downstream is then silently short, and the process still exits 0. macOS is
+/// the common way in, because `zcat` there appends `.Z` and refuses a `.gz`
+/// file, but any failing or truncated decompressor reaches the same place.
+///
+/// The exit status is only meaningful once the child has finished, so it is
+/// checked at end of input rather than at spawn: that also catches a command
+/// that dies part-way through a file, which is the case a start-up check would
+/// miss.
+struct CommandReader {
+    inner: BufReader<std::process::ChildStdout>,
+    child: std::process::Child,
+    /// Filled by a detached thread so the child cannot block on a full stderr
+    /// pipe, and read rather than joined so a grandchild holding that pipe open
+    /// cannot stall the reader. Bounded: see [`STDERR_TAIL_CAP`].
+    stderr: Arc<StderrCapture>,
+    cmd: String,
+    path: PathBuf,
+    /// Set once the child has been waited for, so it is reaped once.
+    reaped: bool,
+    /// Whether any input reached the caller, which decides what the failure
+    /// message can honestly say about the reads.
+    delivered: bool,
+}
+
+impl CommandReader {
+    /// Reap the child at end of input and turn a non-zero exit into an error.
+    fn check_exit(&mut self) -> std::io::Result<()> {
+        if self.reaped {
+            return Ok(());
+        }
+        self.reaped = true;
+        let status = self.child.wait()?;
+        if status.success() {
+            return Ok(());
+        }
+        // Keep the command's own words: they name the real cause, and on macOS
+        // `zcat` they are the difference between "it failed" and "it looked for
+        // a file with a different extension".
+        let said = self.stderr_tail();
+        let detail = if said.is_empty() {
+            String::new()
+        } else {
+            format!(": {said}")
+        };
+        // The command may have failed after emitting valid records, and saying
+        // nothing was read would then be untrue.
+        let consequence = if self.delivered {
+            "Its output is cut short, so the run would otherwise have continued with \
+             only the reads that arrived before it failed."
+        } else {
+            "No reads could be taken from it, so the run would otherwise have \
+             continued as if the file were empty."
+        };
+        Err(std::io::Error::other(format!(
+            "--readFilesCommand {} {} {}{detail}. {consequence}",
+            self.cmd,
+            self.path.display(),
+            match status.code() {
+                Some(c) => format!("exited with status {c}"),
+                None => "was killed by a signal".to_string(),
+            },
+        )))
+    }
+
+    /// What the command printed, waiting briefly for the drain to finish.
+    ///
+    /// The child has exited by the time this is called, so the drain is about to
+    /// see end of input and the wait is a formality — but the last bytes may
+    /// still be in the pipe, and they are usually the message. The wait is
+    /// bounded rather than a `join` because a grandchild that inherited the
+    /// stderr pipe keeps it open after the child is gone, and joining on that
+    /// would hang the run instead of reporting the failure.
+    fn stderr_tail(&self) -> String {
+        let mut tail = self
+            .stderr
+            .tail
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if !tail.finished {
+            let (guard, _) = self
+                .stderr
+                .finished
+                .wait_timeout(tail, Duration::from_millis(200))
+                .unwrap_or_else(PoisonError::into_inner);
+            tail = guard;
+        }
+        tail.message()
+    }
+}
+
+/// Nobody will ask for the status of a reader that is dropped before end of
+/// input — `--readMapNumber` stopping early, or a failure further up — but the
+/// child must not outlive it as a runaway or a zombie, which is what dropping a
+/// `Child` leaves behind. A deliberate stop is not a failure, so nothing is
+/// reported here. Only the direct child is reached: a grandchild of the
+/// command's own making is beyond this reader.
+impl Drop for CommandReader {
+    fn drop(&mut self) {
+        if self.reaped {
+            return;
+        }
+        self.reaped = true;
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl std::io::Read for CommandReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        // Nothing can be delivered into an empty buffer, and reading that as end
+        // of input would charge the command with a failure it has not had.
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let n = self.inner.read(buf)?;
+        if n == 0 {
+            self.check_exit()?;
+        } else {
+            self.delivered = true;
+        }
+        Ok(n)
+    }
+}
+
+impl BufRead for CommandReader {
+    fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+        // `check_exit` borrows self mutably, so decide first, then borrow.
+        if self.inner.fill_buf()?.is_empty() {
+            self.check_exit()?;
+        }
+        self.inner.fill_buf()
+    }
+
+    fn consume(&mut self, amt: usize) {
+        if amt > 0 {
+            self.delivered = true;
+        }
+        self.inner.consume(amt);
+    }
+}
 
 /// Writer for unmapped reads in FASTQ format (`--outReadsUnmapped Fastx`).
 pub struct UnmappedFastqWriter {
@@ -120,7 +328,7 @@ impl FastqReader {
     pub fn open(path: &Path, decompress_cmd: Option<&str>) -> Result<Self, Error> {
         let reader: Box<dyn BufRead + Send> = if let Some(cmd) = decompress_cmd {
             // Use external decompression command
-            Self::open_with_command(path, cmd)?
+            Box::new(Self::open_with_command(path, cmd)?)
         } else {
             // Detect compression from the magic bytes, not the file name, and
             // stack the matching decoder (gzip always; bzip2/zstd/xz when their
@@ -163,11 +371,19 @@ impl FastqReader {
         self
     }
 
-    /// Open FASTQ file using external decompression command
-    fn open_with_command(path: &Path, cmd: &str) -> Result<Box<dyn BufRead + Send>, Error> {
+    /// Open FASTQ file using external decompression command.
+    ///
+    /// The returned reader owns the child and checks how it exited, so a
+    /// decompressor that fails is reported rather than read as an empty file
+    /// (see [`CommandReader`]).
+    fn open_with_command(path: &Path, cmd: &str) -> Result<CommandReader, Error> {
         let mut child = Command::new(cmd)
             .arg(path)
             .stdout(Stdio::piped())
+            // Captured rather than inherited so the failure message can carry
+            // what the command actually said. A thread drains it continuously,
+            // so a chatty command cannot fill the pipe and block.
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|e| Error::io(e, path))?;
 
@@ -177,7 +393,53 @@ impl FastqReader {
             ))
         })?;
 
-        Ok(Box::new(BufReader::with_capacity(1 << 19, stdout)))
+        let stderr = Arc::new(StderrCapture::default());
+        if let Some(mut pipe) = child.stderr.take() {
+            let capture = Arc::clone(&stderr);
+            // Detached: it ends when the pipe closes, and the reader reads the
+            // tail rather than joining, so nothing waits on this thread.
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 4096];
+                loop {
+                    match std::io::Read::read(&mut pipe, &mut chunk) {
+                        Ok(0) => break,
+                        Ok(n) => capture
+                            .tail
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push(&chunk[..n]),
+                        // A signal, not an end: go round again.
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        // A broken drain must not stop the run: the status is
+                        // what matters, and the message simply loses its detail.
+                        Err(_) => break,
+                    }
+                }
+                capture
+                    .tail
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .finished = true;
+                capture.finished.notify_all();
+            });
+        } else {
+            // No pipe to drain, so the tail is already as complete as it gets.
+            stderr
+                .tail
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .finished = true;
+        }
+
+        Ok(CommandReader {
+            inner: BufReader::with_capacity(1 << 19, stdout),
+            child,
+            stderr,
+            cmd: cmd.to_string(),
+            path: path.to_path_buf(),
+            reaped: false,
+            delivered: false,
+        })
     }
 
     /// Get next read with encoded bases
@@ -952,5 +1214,275 @@ mod tests {
             got,
             vec![("r1".into(), 0), ("r2".into(), 1), ("r3".into(), 1)]
         );
+    }
+
+    /// A decompression command that fails must surface as an error, not as an
+    /// empty file. These drive `FastqReader` directly: the failure is in the
+    /// reader, and a CLI test would need a genome index to reach it.
+    ///
+    /// Unix-only because they need a command that reliably fails (`false`), one
+    /// that passes its input through (`cat`), and a shell script.
+    #[cfg(unix)]
+    mod command_failure {
+        use super::super::FastqReader;
+        use std::io::Write;
+
+        /// Four lines, one read, uncompressed — so `cat` is a valid
+        /// "decompressor" for the success case.
+        fn plain_fastq(dir: &std::path::Path) -> std::path::PathBuf {
+            let p = dir.join("reads.fq");
+            let mut f = std::fs::File::create(&p).unwrap();
+            writeln!(f, "@r1\nACGTACGTAC\n+\nIIIIIIIIII").unwrap();
+            p
+        }
+
+        /// Write `body` to an executable `/bin/sh` script and return its path.
+        fn script(dir: &std::path::Path, name: &str, body: &str) -> std::path::PathBuf {
+            let p = dir.join(name);
+            let mut f = std::fs::File::create(&p).unwrap();
+            writeln!(f, "#!/bin/sh\n{body}").unwrap();
+            drop(f);
+            let mut perm = std::fs::metadata(&p).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+            std::fs::set_permissions(&p, perm).unwrap();
+            p
+        }
+
+        /// One read on stdout, then far more than [`STDERR_TAIL_CAP`] of noise
+        /// on stderr, a distinctive last word, and `code`.
+        fn chatty(dir: &std::path::Path, name: &str, code: i32) -> std::path::PathBuf {
+            script(
+                dir,
+                name,
+                &format!(
+                    "printf '@a\\nACGT\\n+\\nIIII\\n'\n\
+                     i=0\n\
+                     while [ $i -lt 400 ]; do\n\
+                     \techo \"noise $i: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\" >&2\n\
+                     \ti=$((i+1))\n\
+                     done\n\
+                     echo 'THE REAL COMPLAINT' >&2\n\
+                     exit {code}"
+                ),
+            )
+        }
+
+        /// Is a process with this id still around? A zombie counts: its entry
+        /// lives until it is reaped, which is the difference being tested.
+        /// `kill` is the shell builtin, so this needs nothing on `PATH`.
+        fn process_exists(pid: u32) -> bool {
+            std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("kill -0 {pid} 2>/dev/null"))
+                .status()
+                .is_ok_and(|s| s.success())
+        }
+
+        /// Read until the reader stops, returning how many reads came out and
+        /// whatever error ended it.
+        fn drain(r: &mut FastqReader) -> (usize, Option<String>) {
+            let mut n = 0;
+            loop {
+                match r.next_encoded() {
+                    Ok(Some(_)) => n += 1,
+                    Ok(None) => return (n, None),
+                    Err(e) => return (n, Some(e.to_string())),
+                }
+            }
+        }
+
+        #[test]
+        fn a_command_that_fails_immediately_is_an_error_not_an_empty_file() {
+            let dir = tempfile::tempdir().unwrap();
+            let fq = plain_fastq(dir.path());
+            let mut r = FastqReader::open(&fq, Some("false")).unwrap();
+            let (n, err) = drain(&mut r);
+            assert_eq!(n, 0);
+            let err = err.expect("a failing command must not read as end of input");
+            assert!(
+                err.contains("--readFilesCommand") && err.contains("false"),
+                "the error must name the command: {err}"
+            );
+            assert!(
+                err.contains("No reads could be taken"),
+                "nothing was read here, and the message should say so: {err}"
+            );
+        }
+
+        /// The case a check at spawn time would miss: the command starts, emits
+        /// part of the file, then dies. Without the exit check the run keeps the
+        /// reads it got and reports success on a truncated input.
+        #[test]
+        fn a_command_that_dies_part_way_is_an_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let fq = plain_fastq(dir.path());
+            let script = dir.path().join("halfway");
+            let mut f = std::fs::File::create(&script).unwrap();
+            // Emits two whole reads, then fails.
+            writeln!(
+                f,
+                "#!/bin/sh\nprintf '@a\\nACGT\\n+\\nIIII\\n@b\\nACGT\\n+\\nIIII\\n'\nexit 3"
+            )
+            .unwrap();
+            drop(f);
+            let mut perm = std::fs::metadata(&script).unwrap().permissions();
+            std::os::unix::fs::PermissionsExt::set_mode(&mut perm, 0o755);
+            std::fs::set_permissions(&script, perm).unwrap();
+
+            let mut r = FastqReader::open(&fq, Some(script.to_str().unwrap())).unwrap();
+            let (n, err) = drain(&mut r);
+            assert_eq!(n, 2, "the reads it did emit should still be read");
+            let err = err.expect("a command that dies part-way must not look like end of input");
+            assert!(
+                err.contains("status 3"),
+                "the error should carry the exit status: {err}"
+            );
+            // Two reads did come out, so claiming none did would be false.
+            assert!(
+                !err.contains("No reads could be taken"),
+                "reads were taken, so the message must not deny it: {err}"
+            );
+            assert!(
+                err.contains("cut short"),
+                "the message should say the input is incomplete: {err}"
+            );
+        }
+
+        #[test]
+        fn a_command_that_succeeds_reads_normally() {
+            let dir = tempfile::tempdir().unwrap();
+            let fq = plain_fastq(dir.path());
+            let mut r = FastqReader::open(&fq, Some("cat")).unwrap();
+            let (n, err) = drain(&mut r);
+            assert_eq!(err, None, "a working command must not error");
+            assert_eq!(n, 1);
+        }
+
+        /// Stopping before the end is normal (`--readMapNumber`), and the child
+        /// then dies of SIGPIPE. That must not be reported as a failure, which
+        /// is why the status is checked at end of input rather than on drop.
+        #[test]
+        fn abandoning_a_working_command_early_is_not_an_error() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("many.fq");
+            let mut f = std::fs::File::create(&p).unwrap();
+            for i in 0..5000 {
+                writeln!(f, "@r{i}\nACGTACGTAC\n+\nIIIIIIIIII").unwrap();
+            }
+            drop(f);
+            let mut r = FastqReader::open(&p, Some("cat")).unwrap();
+            assert!(r.next_encoded().unwrap().is_some());
+            // Dropped here with the child still writing.
+        }
+
+        /// Not an error, but not a loose end either: the reader owns the child,
+        /// so abandoning it must leave no process behind — neither still
+        /// running nor an unreaped zombie, which is what dropping a `Child`
+        /// without waiting leaves. Asserting on the process itself rather than
+        /// on the absence of a panic is the only way to see the difference.
+        #[test]
+        fn abandoning_a_working_command_reaps_the_child() {
+            let dir = tempfile::tempdir().unwrap();
+            let p = dir.path().join("many.fq");
+            let mut f = std::fs::File::create(&p).unwrap();
+            // Long enough that `cat` is still writing when the reader goes.
+            for i in 0..200_000 {
+                writeln!(f, "@r{i}\nACGTACGTAC\n+\nIIIIIIIIII").unwrap();
+            }
+            drop(f);
+
+            let mut reader = FastqReader::open_with_command(&p, "cat").unwrap();
+            let pid = reader.child.id();
+            let mut buf = [0u8; 64];
+            assert!(std::io::Read::read(&mut reader, &mut buf).unwrap() > 0);
+            assert!(
+                process_exists(pid),
+                "the child should be alive to begin with"
+            );
+
+            drop(reader);
+            assert!(
+                !process_exists(pid),
+                "the child was left running or unreaped (pid {pid})"
+            );
+        }
+
+        /// A zero-length read asks for nothing, so it cannot have reached the
+        /// end of anything. Reading it as end of input reaps the child early and
+        /// — with a command that fails — reports a failure before the caller has
+        /// asked for a single byte.
+        #[test]
+        fn an_empty_buffer_is_not_end_of_input() {
+            let dir = tempfile::tempdir().unwrap();
+            let fq = plain_fastq(dir.path());
+
+            let mut failing = FastqReader::open_with_command(&fq, "false").unwrap();
+            assert_eq!(
+                std::io::Read::read(&mut failing, &mut []).unwrap(),
+                0,
+                "an empty read must not report the command's failure"
+            );
+
+            let mut working = FastqReader::open_with_command(&fq, "cat").unwrap();
+            assert_eq!(std::io::Read::read(&mut working, &mut []).unwrap(), 0);
+            assert!(
+                !working.reaped,
+                "an empty read must not reap the child it has not finished with"
+            );
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut working, &mut out).unwrap();
+            assert!(
+                out.starts_with(b"@r1"),
+                "the stream should carry on afterwards"
+            );
+        }
+
+        /// stderr is captured so the failure can carry the command's own words,
+        /// which means a command that talks all day must not be able to grow the
+        /// reader with it. Only a bounded tail is kept — and the tail, not the
+        /// head, because the complaint comes last.
+        #[test]
+        fn a_chatty_command_keeps_only_a_bounded_tail() {
+            let dir = tempfile::tempdir().unwrap();
+            let fq = plain_fastq(dir.path());
+
+            // Succeeding: nothing is reported, and nothing accumulated either.
+            let quiet = chatty(dir.path(), "chatty-ok", 0);
+            let mut reader = FastqReader::open_with_command(&fq, quiet.to_str().unwrap()).unwrap();
+            let mut out = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut out).unwrap();
+            let kept = reader.stderr.tail.lock().unwrap();
+            assert!(
+                kept.bytes.len() <= super::super::STDERR_TAIL_CAP,
+                "retained {} bytes, cap is {}",
+                kept.bytes.len(),
+                super::super::STDERR_TAIL_CAP
+            );
+            assert!(
+                kept.truncated,
+                "the test command should have printed past the cap"
+            );
+            drop(kept);
+
+            // Failing: the message carries the last word and not the noise.
+            let loud = chatty(dir.path(), "chatty-fail", 4);
+            let mut r = FastqReader::open(&fq, Some(loud.to_str().unwrap())).unwrap();
+            let (_, err) = drain(&mut r);
+            let err = err.expect("a command that exits 4 must be an error");
+            assert!(err.contains("status 4"), "{err}");
+            assert!(
+                err.contains("THE REAL COMPLAINT"),
+                "the tail should hold what it said last: {err}"
+            );
+            assert!(
+                !err.contains("noise 0:"),
+                "the earliest noise should have been dropped: {err}"
+            );
+            assert!(
+                err.len() < super::super::STDERR_TAIL_CAP + 512,
+                "the message grew with the command's output: {} bytes",
+                err.len()
+            );
+        }
     }
 }

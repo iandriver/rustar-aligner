@@ -11,6 +11,24 @@ Sections commonly used: Features, Bug fixes, Other changes.
 
 ## [Unreleased]
 
+### Bug fixes
+
+- A `--readFilesCommand` that fails is now reported instead of being read as an
+  empty file. The reader owns the child process and checks how it exited at end
+  of input, so a decompressor that never starts, or that dies part-way through a
+  file, ends the run with an error naming the command, its exit status and what
+  it printed. Previously the child was spawned and never waited for: its pipe
+  closed, the reader saw end of input, and the run continued with however many
+  reads had arrived — zero, if the command failed outright — then exited
+  successfully with empty matrices. The common way in is `--readFilesCommand
+  zcat` on macOS, where `zcat` appends `.Z` and refuses a `.gz` file. Stopping
+  early on purpose (`--readMapNumber`) is unaffected, because the status is
+  checked at end of input rather than when the reader is dropped; the child is
+  still terminated and reaped then, so it is not left running or as a zombie.
+  What the command said is kept as a bounded tail, so a chatty command cannot
+  grow the reader with its output, and a command that fails after emitting valid
+  records is reported as cut short rather than as having produced nothing.
+
 ### Other changes
 
 - Third-party notices completed. `LICENSES/` gains the licences of code
